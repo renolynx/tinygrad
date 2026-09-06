@@ -182,3 +182,11 @@ A fix in `Compiler.compile_server`. It wraps the pipe reads in a loop until n by
 **Note:** the ComfyUI-side workaround (the reclaim dropping a capture that actually freed memory) is now **off by default** - #31 fixes the root cause, and dropping the capture would needlessly send the next prompt back to eager submission. `TINY_JIT_RECLAIM_KEEPS_CAPTURE=0` turns the drop back on as the belt-and-braces path if #31 is ever lost. Verified: #31 + capture kept + reclaim firing = 0 device faults, both Klein quality gates passing.
 
 **#31 的影响面：** `Buffer.deallocate` 是所有工作负载的公共路径，所以每次改动后都要复验。已验：Klein 1024 生产 env 热跑 9.85 s / 冷跑 114.3 s、零故障、质量门通过；SeedVR2 1024->2048 热跑 122.58 s、输出逐字节相同。
+
+## Patch 35 (2026-09-05): `nv_flash_attention(out_dtype=..., out_nbh=True)` in `tinygrad/llm/kernels/nv.py`
+
+The flash kernel can write its output in the buffer's own dtype (half/bf16) and in the `[N, BH*D]` row-major layout the following linear reads (`out[row, bh*D + c]`), instead of fp32 `[BH, N, D]` plus a relayout/cast pass. Used by ComfyUI's MiniMax H3 fused attention (`comfy/tiny_ops_shim.py::h3_fused_attention`): the 864x480 eager first step went from OOM (>16 GB, nine fp32 [15488, 7168] temporaries) to 9.1 GB peak. Kernel names get `_nbh` / `_o<dtype>` suffixes so the two forms never share a cache entry. Verify: `grep -c out_nbh tinygrad/llm/kernels/nv.py` >= 6.
+
+## Patch 36 (2026-09-05): signed inputs for BEAM_VERIFY in `tinygrad/codegen/opt/search.py`
+
+`_fill_bufs_deterministic` (patch #9's helper) filled every buffer with bytes <= 0x3F, i.e. only POSITIVE floats below 1.0. A tensor-core winner for H3's fused swiglu+fc2 kernel passed that check and computed garbage (rel err 1.3) on real, signed activations; every DiT latent of the evening was noise (spatial autocorrelation 0.16 instead of 0.94) and it took hours to find because eager, capture, replay and the flash/attention changes all "passed". Odd bytes now come from `{0x3D,0x3E,0x3F,0xBD,0xBE,0xBF}` (sign+exponent of f32/f16/bf16 -> finite, signed, |x| in ~[0.03, 4]); even bytes vary freely. The ComfyUI shim (`_verify_transfer`) uses the same helper to check transferred BEAM opts and cached winners once per process and re-searches with the cache bypassed on a mismatch. Verify: `grep -c _VERIFY_HI tinygrad/codegen/opt/search.py` >= 2.
