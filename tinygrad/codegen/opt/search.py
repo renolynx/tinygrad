@@ -90,14 +90,20 @@ def _ensure_buffer_alloc(bufs:list[Buffer]) -> list[Buffer]: return [buf.ensure_
 # Cheap defense: run the unoptimized baseline and the winner on identical pseudo-random
 # inputs and compare outputs; a miscompile is wildly wrong, float reorder is not.
 
+_VERIFY_HI = (0x3D, 0x3E, 0x3F, 0xBD, 0xBE, 0xBF)   # sign+exponent bytes: finite, signed, |x| in ~[0.03, 4] for f32/f16/bf16
+
 def _fill_bufs_deterministic(bufs:list[Buffer]):
-  # the byte pattern ((k*7 + 13 + i*31) & 0x3F) has period 64 in k, so build one period and tile it: an np.arange over a
+  # the byte pattern has period 64 in k, so build one period and tile it: an np.arange over a
   # 500 MB weight view (the LLM decode kernels take views of the GGUF) would spike host RAM by ~2 GB per fill (2026-09-02)
+  # 2026-09-05: the old pattern (every byte <= 0x3F) only produced POSITIVE floats below 1.0, and a tensor-core winner for
+  # MiniMax H3's fused swiglu+fc2 kernel passed on it while computing garbage on real (signed, ~N(0,0.5)) activations.
+  # Odd bytes are the high byte of every 2-byte float and byte 3 of every 4-byte float: draw them from _VERIFY_HI so
+  # the inputs are signed and of order 1; even bytes (mantissa) vary freely.
   for i, b in enumerate(bufs):
     if b is None: continue
     b.ensure_allocated()
     n = b.nbytes
-    period = bytes(((k * 7 + 13 + i * 31) & 0x3F) for k in range(64))  # high bytes small -> finite floats
+    period = bytes((_VERIFY_HI[(k * 5 + 3 + i * 7) % len(_VERIFY_HI)] if k & 1 else (k * 37 + 11 + i * 31) & 0xFF) for k in range(64))
     Device[b.device].allocator._copyin(b._buf, memoryview(period * (n // 64) + period[:n % 64]))
 
 def _read_out_f32(buf:Buffer):

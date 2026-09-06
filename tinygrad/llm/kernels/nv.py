@@ -129,7 +129,7 @@ def _kernel_var(x:UOp) -> UOp:
 
 @functools.cache
 def _nv_flash_kernel(out:UOp, q:UOp, k:UOp, v:UOp, BH:int, N:int, NK:int, D:int, GQA:int, causal:bool, q_start, scale_log2e:float,
-                     DV:int=0, dv0:int=0, cache_mode:bool=False, kvx:UOp|None=None, KVHI:int=0) -> UOp:
+                     DV:int=0, dv0:int=0, cache_mode:bool=False, kvx:UOp|None=None, KVHI:int=0, out_nbh:bool=False) -> UOp:
   # Local patch #34 (2026-09-05, MiniMax H3 length-agnostic capture): kvx is an int32[1] buffer holding kv_lo; keys in
   # [kv_lo, KVHI) are masked out. Read at kernel run time, so one captured graph serves every prompt whose padded text
   # segment is KVHI rows long.
@@ -229,6 +229,7 @@ def _nv_flash_kernel(out:UOp, q:UOp, k:UOp, v:UOp, BH:int, N:int, NK:int, D:int,
   update = UOp.group(*(accs[nd].store(cur[nd]) for nd in range(DN)), *(mreg[r].store(m_new[r]) for r in range(2)),
                      *(lreg[r].store(l_new[r]) for r in range(2))).end(tile)
   # 5. normalise and store the valid rows
+  odt = out.dtype
   lf = lreg.after(update)
   inv = (1.0 / lf[0].load(), 1.0 / lf[1].load())
   stores = []
@@ -237,29 +238,33 @@ def _nv_flash_kernel(out:UOp, q:UOp, k:UOp, v:UOp, BH:int, N:int, NK:int, D:int,
     c0 = dv0 + 8 * nd + 2 * t
     for r in range(2):
       row = rows[r] if N % BM == 0 else rows[r].valid(rows[r] < N)
-      stores += [out[bh, row, c0].store(o[2 * r].load() * inv[r]), out[bh, row, c0 + 1].store(o[2 * r + 1].load() * inv[r])]
-  name = f"nv_flash_bh{BH}_n{N}_nk{NK}_d{D}_v{dv0}_{DV}_g{GQA}{'_causal' if causal else ''}{'_cache' if cache_mode else ''}{f'_x{KVHI}' if kvx is not None else ''}"
+      # out_nbh (2026-09-05, MiniMax H3): write [N, BH, D] = the (S, H*D) row-major layout the next linear reads, in
+      # the buffer's own dtype, so no relayout/cast pass over a full-width fp32 output follows the kernel
+      slot = (lambda c: out[row, bh * D + c]) if out_nbh else (lambda c: out[bh, row, c])   # out_nbh: out is [N, BH*D]
+      stores += [slot(c0).store((o[2 * r].load() * inv[r]).cast(odt)), slot(c0 + 1).store((o[2 * r + 1].load() * inv[r]).cast(odt))]
+  name = f"nv_flash_bh{BH}_n{N}_nk{NK}_d{D}_v{dv0}_{DV}_g{GQA}{'_causal' if causal else ''}{'_cache' if cache_mode else ''}{f'_x{KVHI}' if kvx is not None else ''}{'_nbh' if out_nbh else ''}{'' if odt == dtypes.float32 else '_o' + odt.name}"
   return UOp.group(*stores).end(wave, lane).end(qb, bh).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
 def nv_flash_attention(q:Tensor, k:Tensor, v:Tensor, causal:bool=False, q_start:int=0, scale:float|None=None,
-                       kv_lo:Tensor|None=None, kv_hi:int=0) -> Tensor:
+                       kv_lo:Tensor|None=None, kv_hi:int=0, out_dtype=dtypes.float32, out_nbh:bool=False) -> Tensor:
   """q [BH, N, D], k/v [BH_KV, NK, D] (half, BH % BH_KV == 0) -> [BH, N, D] float32 softmax(q k^T * scale) v.
-  kv_lo (int32 [1] tensor on the device) + kv_hi: keys in [kv_lo, kv_hi) are excluded (patch #34)."""
+  kv_lo (int32 [1] tensor on the device) + kv_hi: keys in [kv_lo, kv_hi) are excluded (patch #34).
+  out_dtype / out_nbh (2026-09-05): the kernel can write half/bf16 and the [N, BH*D] row-major layout directly."""
   BH, N, D = q.shape
   BHK, NK, DK = k.shape
   assert all(isinstance(x, int) for x in (BH, N, D, BHK, NK)) and DK == D and v.shape == k.shape and BH % BHK == 0
   q, k, v = (x.cast(dtypes.half).contiguous() for x in (q, k, v))
-  out = Tensor.empty(BH, N, D, dtype=dtypes.float32, device=q.device)
+  out = Tensor.empty(*((N, BH * D) if out_nbh else (BH, N, D)), dtype=out_dtype, device=q.device)
   sl = (D ** -0.5 if scale is None else scale) * math.log2(math.e)
   if kv_lo is not None: kv_lo = kv_lo.cast(dtypes.int32).reshape(1).contiguous()
   for dv0 in range(0, D, 128):  # D > 128: one pass per 128-wide output slice (S is recomputed, V/O tiles stay small)
     if kv_lo is None:
       fxn = functools.partial(_nv_flash_kernel, BH=BH, N=N, NK=NK, D=D, GQA=BH // BHK, causal=causal, q_start=q_start,
-                              scale_log2e=sl, DV=min(128, D - dv0), dv0=dv0)
+                              scale_log2e=sl, DV=min(128, D - dv0), dv0=dv0, out_nbh=out_nbh)
       out = Tensor.custom_kernel(out, q, k, v, fxn=fxn)[0]
     else:
       fxn = functools.partial(_nv_flash_kernel, BH=BH, N=N, NK=NK, D=D, GQA=BH // BHK, causal=causal, q_start=q_start,
-                              scale_log2e=sl, DV=min(128, D - dv0), dv0=dv0, KVHI=int(kv_hi))
+                              scale_log2e=sl, DV=min(128, D - dv0), dv0=dv0, KVHI=int(kv_hi), out_nbh=out_nbh)
       fxn5 = lambda o, qq, kk, vv, kx, _f=fxn: _f(o, qq, kk, vv, kvx=kx)
       out = Tensor.custom_kernel(out, q, k, v, kv_lo, fxn=fxn5)[0]
   return out
