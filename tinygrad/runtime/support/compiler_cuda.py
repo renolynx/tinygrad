@@ -46,14 +46,14 @@ def cuda_disassemble(lib:bytes, arch:str, ptx=False):
 class NVRTCCompiler(Compiler):
   def __init__(self, arch:str, ptx=True, cache_key:str="cuda"):
     self.ptx, self.arch, self.compile_options = ptx, arch, [f'--gpu-architecture={arch}']
-    if OSX: self.compiler_process = self.server(osx_docker_cmd, arch, ptx)
+    if OSX: self._server_args = (osx_docker_cmd, arch, ptx)  # container started lazily, see Compiler.compiler_process
     else:
       self.compile_options += [f"-I{CUDA_PATH}/include"] if CUDA_PATH else ["-I/usr/local/cuda/include", "-I/usr/include", "-I/opt/cuda/include"]
       nvrtc_check(nvrtc.nvrtcVersion((nvrtcMajor := ctypes.c_int()), (nvrtcMinor := ctypes.c_int())))
       if (nvrtcMajor.value, nvrtcMinor.value) >= (12, 4): self.compile_options.append("--minimal")
     super().__init__(f"compile_{cache_key}_{self.arch}")
   def compile(self, src:str) -> bytes:
-    if OSX: return self.compile_server(src, self.compiler_process)
+    if OSX: return self.compile_via_server(src)
     nvrtc_check(nvrtc.nvrtcCreateProgram(ctypes.byref(prog := nvrtc.nvrtcProgram()), src.encode(), "<null>".encode(), 0, None, None))
     nvrtc_check(nvrtc.nvrtcCompileProgram(prog, len(self.compile_options), to_char_p_p([o.encode() for o in self.compile_options])), prog)
     data = _get_bytes(prog, nvrtc.nvrtcGetPTX if self.ptx else nvrtc.nvrtcGetCUBIN,
@@ -85,11 +85,11 @@ class PTXCompiler(Compiler):
 
 class NVPTXCompiler(PTXCompiler):
   def __init__(self, arch:str):
-    if OSX: self.compiler_process = self.server(osx_docker_cmd, arch)
+    if OSX: self._server_args = (osx_docker_cmd, arch)  # container started lazily, see Compiler.compiler_process
     else: jitlink_check(jitlink.nvJitLinkVersion(ctypes.byref(ctypes.c_uint()), ctypes.byref(ctypes.c_uint())))
     super().__init__(arch, cache_key="nv_ptx")
   def compile(self, src:str) -> bytes:
-    if OSX: return self.compile_server(src, self.compiler_process)
+    if OSX: return self.compile_via_server(src)
     jitlink_check(jitlink.nvJitLinkCreate(handle := jitlink.nvJitLinkHandle(), 1, to_char_p_p([f'-arch={self.arch}'.encode()])), handle)
     jitlink_check(jitlink.nvJitLinkAddData(handle, jitlink.NVJITLINK_INPUT_PTX, ptxsrc:=super().compile(src), len(ptxsrc), "<null>".encode()), handle)
     jitlink_check(jitlink.nvJitLinkComplete(handle), handle)

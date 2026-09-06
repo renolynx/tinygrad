@@ -1,7 +1,7 @@
 from dataclasses import replace, dataclass
 import itertools, functools
 from tinygrad.helpers import DISABLE_FAST_IDIV, TRANSCENDENTAL, SPEC, DEBUG, VIZ, IMAGE, NOOPT, EMULATED_DTYPES, NOLOCALS, USE_TC
-from tinygrad.helpers import ALLOW_TF32, DEFAULT_FLOAT, DEFAULT_INT, NUM_CPU_THREADS, TC_SELECT, TC_OPT, TracingKey, Context, panic
+from tinygrad.helpers import ALLOW_TF32, DEFAULT_FLOAT, DEFAULT_INT, NUM_CPU_THREADS, TC_SELECT, TC_OPT, TracingKey, Context, panic, getenv
 from tinygrad.uop.ops import PatternMatcher, graph_rewrite, UOp, Ops, UPat, rewrite_group, KernelInfo, ProgramInfo, GroupOp, AxisType
 from tinygrad.uop.weak import pm_lower_weak, pm_commit_weak, pm_cast_const
 from tinygrad.uop.render import pyrender
@@ -452,8 +452,24 @@ def do_render(ctx:Renderer, prg:UOp, lin:UOp) -> UOp:
   src = ctx.render(list(lin.src))
   return prg.replace(src=prg.src + (UOp(Ops.SOURCE, arg=src),))
 
+# LOCAL PATCH (2026-09-01): pool workers (beam search, parallel lowering) never compile. On macOS every compile goes
+# through a docker container and a worker process cannot share the parent's; 8 workers each owning containers (a fresh
+# one per unpickled renderer, i.e. per task) flooded the colima socket forwarder and OOMed the 6 GiB VM. Workers stop at
+# SOURCE with a BINARY(None) placeholder; the parent finalizes through its single container (finalize_program).
+def in_worker_process() -> bool:
+  import multiprocessing
+  return multiprocessing.parent_process() is not None and not getenv("WORKER_COMPILE", 0)
+
+def finalize_program(prg:UOp, renderer:Renderer) -> UOp:
+  """compile a PROGRAM that a worker process left at SOURCE (BINARY arg None); a no-op for finished programs"""
+  if prg.op is Ops.PROGRAM and prg.src[-1].op is Ops.BINARY and prg.src[-1].arg is None:
+    assert prg.src[-2].op is Ops.SOURCE, "deferred PROGRAM without SOURCE"
+    return prg.replace(src=prg.src[:-1] + (UOp(Ops.BINARY, arg=renderer.compiler.compile_cached(prg.src[-2].arg)),))
+  return prg
+
 def do_compile(ctx:Renderer, prg:UOp, source:UOp) -> UOp|None:
   if DEBUG >= 4: print(source.arg)
+  if in_worker_process(): return prg.replace(src=prg.src + (UOp(Ops.BINARY, arg=None),))
   lib = ctx.compiler.compile_cached(source.arg)
   if DEBUG >= 7: ctx.compiler.disassemble(lib)
   return prg.replace(src=prg.src + (UOp(Ops.BINARY, arg=lib),))

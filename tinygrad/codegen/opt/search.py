@@ -1,4 +1,4 @@
-import math, time, traceback, signal
+import math, time, traceback, signal, threading
 from dataclasses import replace
 from tinygrad.uop.ops import sym_infer, AxisType, UOp, Ops
 from tinygrad.uop.render import pyrender
@@ -7,8 +7,8 @@ from tinygrad.helpers import prod, flatten, DEBUG, CACHELEVEL, diskcache_get, di
 from tinygrad.helpers import IGNORE_BEAM_CACHE
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
 from tinygrad.engine.realize import time_call
-from tinygrad.engine.worker import get_worker_pool, terminate_worker_pool
-from tinygrad.codegen import to_program
+from tinygrad.engine.worker import get_worker_pool, terminate_worker_pool, pool_imap_bounded
+from tinygrad.codegen import to_program, finalize_program
 from tinygrad.codegen.opt.postrange import Scheduler
 
 actions = [Opt(op=OptOps.UPCAST, axis=axis, arg=amt) for amt in [0,2,3,4,5,7] for axis in range(8)]
@@ -56,7 +56,10 @@ def timeout_handler(signum, frame):
   raise TimeoutException()
 
 def _try_compile(x:tuple[int,Scheduler]) -> tuple[int, tuple[UOp, float]|None]:
-  if hasattr(signal, "alarm"):
+  # signal only works in the main thread; when beam runs inside a server worker
+  # thread (e.g. ComfyUI) skip the compile timeout instead of crashing
+  use_alarm = hasattr(signal, "alarm") and threading.current_thread() is threading.main_thread()
+  if use_alarm:
     signal.signal(getattr(signal, 'SIGALRM'), timeout_handler)
     # set timeout
     signal.alarm(getenv("BEAM_TIMEOUT_SEC", 10))
@@ -76,10 +79,71 @@ def _try_compile(x:tuple[int,Scheduler]) -> tuple[int, tuple[UOp, float]|None]:
   except Exception as e:
     if getenv("BEAM_STRICT_MODE"): raise e
   finally:
-    if hasattr(signal, "alarm"): signal.alarm(0)
+    if use_alarm: signal.alarm(0)
   return x[0], ret
 
 def _ensure_buffer_alloc(bufs:list[Buffer]) -> list[Buffer]: return [buf.ensure_allocated() if buf is not None else buf for buf in bufs]
+
+# *** winner verification (BEAM_VERIFY=1) ***
+# tinygrad never checks that a fast candidate computes the RIGHT thing; on this rig the
+# tensor-core action miscompiles some shapes and "wins" by being wrong (pure-noise images).
+# Cheap defense: run the unoptimized baseline and the winner on identical pseudo-random
+# inputs and compare outputs; a miscompile is wildly wrong, float reorder is not.
+
+def _fill_bufs_deterministic(bufs:list[Buffer]):
+  # the byte pattern ((k*7 + 13 + i*31) & 0x3F) has period 64 in k, so build one period and tile it: an np.arange over a
+  # 500 MB weight view (the LLM decode kernels take views of the GGUF) would spike host RAM by ~2 GB per fill (2026-09-02)
+  for i, b in enumerate(bufs):
+    if b is None: continue
+    b.ensure_allocated()
+    n = b.nbytes
+    period = bytes(((k * 7 + 13 + i * 31) & 0x3F) for k in range(64))  # high bytes small -> finite floats
+    Device[b.device].allocator._copyin(b._buf, memoryview(period * (n // 64) + period[:n % 64]))
+
+def _read_out_f32(buf:Buffer):
+  import numpy as np
+  raw = bytes(buf.as_memoryview())
+  fmt = getattr(buf.dtype, "fmt", None)
+  if fmt in ("f", "e", "d"): return np.frombuffer(raw, dtype=np.dtype(fmt)).astype(np.float32)
+  if "bfloat16" in str(buf.dtype): return (np.frombuffer(raw, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32).astype(np.float32)
+  if fmt is not None:
+    try: return np.frombuffer(raw, dtype=np.dtype(fmt)).astype(np.float32)
+    except (TypeError, ValueError): return None
+  return None
+
+def _run_once_full(sched:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int]) -> bool:
+  _, proc = _try_compile((0, sched.copy()))
+  if proc is None: return False
+  tms = _time_program(proc[0], var_vals, rawbufs, cnt=1, allow_test_size=False, max_global_size=None)
+  return all(t != math.inf for t in tms)
+
+def _verify_winner(base:Scheduler, cand:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int]) -> bool:
+  import numpy as np
+  try:
+    _fill_bufs_deterministic(rawbufs)
+    if not _run_once_full(base, rawbufs, var_vals):
+      if DEBUG >= 1: print("BEAM_VERIFY SKIPPED: baseline would not run; accepting")
+      return True  # can't verify -> don't block
+    ref = _read_out_f32(rawbufs[0])
+    if ref is None:
+      if DEBUG >= 1: print(f"BEAM_VERIFY SKIPPED: unreadable ref dtype {rawbufs[0].dtype}; accepting")
+      return True
+    _fill_bufs_deterministic(rawbufs)
+    if not _run_once_full(cand, rawbufs, var_vals): return False
+    got = _read_out_f32(rawbufs[0])
+    if got is None:
+      if DEBUG >= 1: print(f"BEAM_VERIFY SKIPPED: unreadable cand dtype {rawbufs[0].dtype}; accepting")
+      return True
+    ok = bool(np.allclose(ref, got, rtol=1e-2, atol=1e-3, equal_nan=True))
+    if DEBUG >= 1:
+      if ok: print(f"BEAM_VERIFY PASS ({ref.size} outputs match) for {cand.applied_opts}")
+      else:
+        bad = int((~np.isclose(ref, got, rtol=1e-2, atol=1e-3, equal_nan=True)).sum())
+        print(f"BEAM_VERIFY REJECTED {cand.applied_opts} ({bad}/{ref.size} outputs mismatch)")
+    return ok
+  except Exception as e:
+    if DEBUG >= 1: print(f"BEAM_VERIFY inconclusive ({type(e).__name__}: {e}); accepting candidate")
+    return True
 
 # *** external API ***
 
@@ -116,7 +180,7 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:i
     return ret
 
   beam: list[tuple[Scheduler, float]] = [(s, float("inf"))]
-  seen_libs = set()
+  seen_libs, seen_srcs = set(), set()
 
   pool = get_worker_pool()
 
@@ -134,9 +198,25 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:i
       candidates: list[Scheduler] = flatten([get_kernel_actions(si, include_0=False).values() for si,_ in beam])
       timed: list[tuple[Scheduler, float]] = []
       least_compute_ops = math.inf
-      for i, proc in ((map if pool is None else pool.imap_unordered)(_try_compile, enumerate(candidates))):
+      # LOCAL PATCH: pool re-fetched per round (a timeout tears it down) and iterated with a bounded wait; candidates
+      # whose worker died are simply not timed this round
+      pool = get_worker_pool()
+      for i, proc in (map(_try_compile, enumerate(candidates)) if pool is None else
+                      pool_imap_bounded(pool, _try_compile, list(enumerate(candidates)))):
         if proc is None: continue
         prg, compile_et = proc
+        # LOCAL PATCH: workers return uncompiled programs (codegen.in_worker_process). identical source -> identical
+        # binary, so dedupe on source first, then compile here through the parent's single docker container.
+        if len(prg.src) >= 3 and prg.src[2].op is Ops.SOURCE:
+          if (src_txt:=prg.src[2].arg) in seen_srcs: continue
+          seen_srcs.add(src_txt)
+        try:
+          cst = time.perf_counter()
+          prg = finalize_program(prg, s.ren)
+          compile_et += time.perf_counter() - cst
+        except Exception as e:
+          if BEAM_DEBUG: print(f"BEAM compile failed for opts: {candidates[i].applied_opts}\n{e}")
+          continue
         if (lib:=prg.src[3].arg) in seen_libs: continue
         # filter out kernels that use 1000x more compute than the smallest
         estimates = prg.src[0].arg.estimates
@@ -173,6 +253,25 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:i
     terminate_worker_pool()
     raise e
 
+  if getenv("BEAM_VERIFY", 0):
+    winner = None
+    for cand, _tm in beam:
+      if cand.applied_opts == s.applied_opts:
+        # nothing beat the unoptimized kernel (or every candidate was dropped): banked without verification, say so
+        if DEBUG >= 1: print(f"BEAM_VERIFY NOOP: best candidate is the unoptimized kernel {s.applied_opts}")
+        winner = cand
+        break
+      if _verify_winner(s, cand, rawbufs, var_vals):
+        winner = cand
+        break
+      if DEBUG >= 1: print(f"BEAM_VERIFY: dropping miscompiled winner, trying next candidate")
+    if winner is None:
+      if DEBUG >= 1: print("BEAM_VERIFY: every candidate failed verification; returning unoptimized kernel")
+      winner = s
+    if CACHELEVEL >= 1: diskcache_put("beam_search", key, winner.applied_opts)
+    # LOCAL PATCH (2026-09-02): the audit line used to be unreachable under BEAM_VERIFY; log the banked winner's time too
+    if BEAM_DEBUG: print(f"BEAM_SEARCH: final tm={time_to_str(next((t for c,t in beam if c is winner), float('inf')), w=0)}, applied_opts={winner.applied_opts}")
+    return winner
   if CACHELEVEL >= 1: diskcache_put("beam_search", key, beam[0][0].applied_opts)
   if BEAM_DEBUG: print(f"BEAM_SEARCH: final tm={time_to_str(beam[0][1], w=0)}, applied_opts={beam[0][0].applied_opts}")
   return beam[0][0]

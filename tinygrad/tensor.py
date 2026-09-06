@@ -69,6 +69,9 @@ def _make_buffer_view(src:UOp) -> UOp|None:
   if (cv := src.contiguous_view()) is None: return None
   (buf, offset), size = cv, src.max_numel() * src.element_size() // cv[0].element_size()
   if buf.op is not Ops.BUFFER: return None
+  # LOCAL PATCH #26 (2026-09-03): kernels vectorize loads/stores assuming 16-byte aligned buffers; a view whose byte offset
+  # is not a multiple of 16 (e.g. int32 x[1:-1]) then faults on NV (misaligned int4 load). Copy instead of aliasing.
+  if isinstance(offset, int) and (offset * cv[0].element_size()) % 16 != 0: return None
   # NB: make offset a UOp.variable here to do the offset computation in the kernels
   return buf[offset:offset+size].bitcast(src.dtype)
 
@@ -240,13 +243,30 @@ def transform_to_call(big_sink:UOp) -> tuple[UOp, dict[UOp, UOp]]:
 
 # *** all in scope Tensors are here. this gets relevant UOps ***
 
+TINY_FAST_SWEEP = getenv("TINY_FAST_SWEEP", 1)   # LOCAL PATCH #27: skip always-realized Tensors in the scope sweep
+
 all_tensors: dict[weakref.ref[Tensor], None] = {}
 def _apply_map_to_tensors(applied_map:dict[UOp, UOp], name:str) -> None:
   with cpu_profile(TracingKey(name), "TINY"):
     # get tensors in scope
     in_scope: dict[UOp, bool] = {}
+    scope_tensors: list[Tensor]
     def visitor(node: UOp) -> bool: return True if node in applied_map else any(in_scope.get(s, False) for s in node.src)
-    scope_tensors: list[Tensor] = [t for tref in list(all_tensors) if (t:=tref()) is not None and t.uop.topovisit(visitor, in_scope)]
+    # LOCAL PATCH #27 (2026-09-04): skip always-realized Tensors. A UOp with buffer identity reaches a BUFFER/PARAM
+    # through RESHAPE/UNSHARD/MSELECT only, so it has no unrealized ancestors and substitution cannot change it -
+    # unless the map names a node in that short chain, which is checked directly. Model weights are exactly this and
+    # stay live for the whole process: SeedVR2's DiT keeps 845 of them and the module-boundary realize hook fires
+    # ~1000 times per forward, so they were re-walked ~845k times per image. TINY_FAST_SWEEP=0 restores the old walk.
+    def _skippable(u:UOp) -> bool:
+      while u.op in {Ops.RESHAPE, Ops.UNSHARD, Ops.MSELECT}:
+        if u in applied_map: return False
+        u = u.src[0]
+      return u.op in {Ops.BUFFER, Ops.PARAM} and u not in applied_map
+    if TINY_FAST_SWEEP:
+      scope_tensors = [t for tref in list(all_tensors)
+                       if (t:=tref()) is not None and not _skippable(t.uop) and t.uop.topovisit(visitor, in_scope)]
+    else:
+      scope_tensors = [t for tref in list(all_tensors) if (t:=tref()) is not None and t.uop.topovisit(visitor, in_scope)]
 
     # get all Tensors and apply the map. always walk: replace exactly the nodes the map names, values are final
     sink = UOp.sink(*[t.uop for t in scope_tensors])

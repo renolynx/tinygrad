@@ -259,14 +259,22 @@ class _TinyJit(Generic[ReturnType]):
       big_linear = UOp(Ops.LINEAR, src=tuple(flatten([l.src for l in self._linears])))
       del self._linears
 
+      extra_held: set[UOp] = set()
       if self.prune:
         big_linear, onetime_linear = prune_linear(big_linear, set(input_buf_uops))
         if DEBUG >= 1: print(f"pruned from {len(big_linear.src) + len(onetime_linear.src)} -> {len(big_linear.src)} kernels")
         run_linear(onetime_linear, var_vals)
+        # one-time outputs are read by the kept linear but never rewritten during replay:
+        # the planner must not fold them into the reusable arena
+        extra_held = {b for si in onetime_linear.src for src in si.src[1:] for b in _collect_bufs(src)}
         del onetime_linear
 
-      # hold all buffers reachable from live Tensors (e.g. lazy .grad created during capture), the memory planner can't suballocate those
-      held_bufs = set(buffers) | {u for tref in list(all_tensors) if (t:=tref()) is not None for u in t.uop.toposort() if u.op is Ops.BUFFER}
+      # hold buffers reachable from live Tensors (weights, model state, returned tensors, lazy .grad)
+      # plus the one-time prologue outputs. NOT set(buffers): when the capture ran eagerly (torch
+      # backend with per-module realize), every intermediate is allocated and registered there while
+      # big_linear keeps its uop alive - holding them all disables planning entirely, and the replay
+      # then keeps the whole step's intermediates resident (~9 GB at 512px, OOM on a 16 GB card)
+      held_bufs = extra_held | {u for tref in list(all_tensors) if (t:=tref()) is not None for u in t.uop.toposort() if u.op is Ops.BUFFER}
       linear = jit_lower(big_linear, held_bufs, input_buf_uops)
       # drop the pre-planning graph: it keeps the whole capture-time working set allocated (big_linear) or referenced (held_bufs).
       # the planned linear only uses the arena/held buffers, so the intermediates must be freed before linking and first exec

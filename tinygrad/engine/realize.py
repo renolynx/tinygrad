@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import cast, Iterator, Any, Sequence
-import random, itertools, math, weakref, array, decimal
+import random, itertools, math, weakref, array, decimal, time
 from dataclasses import dataclass, replace, field
 from tinygrad.helpers import colored, DEBUG, GlobalCounters, ansipad, all_int, prod, flatten, Context, to_tuple, tqdm, dedup
 from tinygrad.helpers import BEAM, size_to_str, time_to_str, VALIDATE_WITH_CPU, HCQ2, PROFILE, ProfilePointEvent, cpu_events, perf_counter_us
@@ -8,9 +8,9 @@ from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat, AxisType, sym_infer
 from tinygrad.device import Device, Buffer, MultiBuffer, ProfileGraphEntry
 from tinygrad.dtype import dtypes
 from tinygrad.renderer import Estimates, Renderer
-from tinygrad.codegen import to_program, to_program_cache, to_program_key, to_program_context
+from tinygrad.codegen import to_program, to_program_cache, to_program_key, to_program_context, finalize_program
 from tinygrad.codegen.opt.postrange import args_from_ast
-from tinygrad.engine.worker import get_worker_pool, terminate_worker_pool
+from tinygrad.engine.worker import get_worker_pool, terminate_worker_pool, pool_imap_bounded
 
 # **************** Helpers ****************
 
@@ -256,7 +256,17 @@ pm_beam = PatternMatcher([
 # **************** parallel lowering + compilation ****************
 
 def _compile_kernel(x:tuple[int, tuple[UOp, Renderer], dict]) -> tuple[int, UOp]:
-  with Context(**x[2]): return x[0], to_program(*x[1])
+  # LOCAL PATCH (2026-09-01): name big kernels as they start and slow ones as they finish (DEBUG>=1), so a lowering that
+  # stalls for tens of minutes - measured at 1024px: three kernels never came back from the pool in 20 min and then
+  # occupied the parent for 35+ min - can be identified from the log instead of guessed at.
+  ast = x[1][0]
+  n_uops = len(ast.toposort()) if DEBUG >= 1 else 0
+  tag = f"{getattr(ast.arg, 'name', '?')}/{n_uops}uops/{abs(hash(ast.key)) % 0xFFFFFF:06x}"
+  if n_uops > 3000: print(f"lowering big kernel {tag} ...", flush=True)
+  st = time.perf_counter()
+  with Context(**x[2]): ret = x[0], to_program(*x[1])
+  if DEBUG >= 1 and (dt:=time.perf_counter()-st) > 30: print(f"slow lowering: {tag} -> {ret[1].src[0].arg.name} took {dt:.0f}s", flush=True)
+  return ret
 
 def _get_call_to_compile(c:UOp) -> tuple[UOp, Renderer]|None:
   ast = a0.src[0] if (a0:=c.src[0]).op is Ops.CUSTOM_FUNCTION and a0.arg == "hcq" else a0
@@ -264,6 +274,13 @@ def _get_call_to_compile(c:UOp) -> tuple[UOp, Renderer]|None:
   if ast.op is Ops.SINK or (ast.op is Ops.PROGRAM and not (isinstance(ast.arg, ProgramInfo) and ast.src[-1].op is Ops.BINARY)):
     return ast, Device[c.device if isinstance(c.device, str) else c.device[0]].renderer
   return None
+
+# LOCAL PATCH (2026-09-01): which kernels must be lowered in the parent process. Beam search needs the device and
+# the parent's hooks: ComfyUI's tiny_ops_shim decides per kernel, by loop volume, whether to run a beam search, and a
+# spawn worker has no such hook - with PARALLEL>0 those kernels silently skipped the search (measured: 2 of ~23 beamed,
+# warm 512 = 612 s instead of 52 s). The shim overrides this predicate; the default is upstream's KernelInfo.beam check.
+def default_needs_parent_lowering(ast:UOp, ren:Renderer) -> bool: return bool(getattr(ast.arg, "beam", 0))
+needs_parent_lowering = default_needs_parent_lowering
 
 def lower_and_compile(linear:UOp) -> UOp:
   # collect the kernels to lower and compile, deduped by their compile cache key
@@ -274,16 +291,24 @@ def lower_and_compile(linear:UOp) -> UOp:
   todo = list({keys[c]: a for c, a in ar.items() if keys[c] not in to_program_cache}.items())
   if len(todo):
     # kernels that beam search must compile in the parent, beam needs device access to time candidates
-
-    pool = None if len(todo) == 1 or any(getattr(c.src[0].arg, "beam", 0) for c in ar) else get_worker_pool()
+    # LOCAL PATCH: partition by needs_parent_lowering instead of sending the whole batch one way
     ctx = {v.key: v.value for v in to_program_context}
-    tasks = ((i, ast_ren, ctx) for i, (_, ast_ren) in enumerate(todo))
+    parent_idx = [i for i, (_, ast_ren) in enumerate(todo) if needs_parent_lowering(*ast_ren)]
+    pool_idx = [i for i in range(len(todo)) if i not in set(parent_idx)]
+    pool = None if len(pool_idx) <= 1 else get_worker_pool()
     try:
       with tqdm(total=len(todo), desc="compiling", disable=DEBUG<1) as pbar:
-        for i, prg in (map if pool is None else pool.imap_unordered)(_compile_kernel, tasks):
+        def store(i:int, prg:UOp):
           pbar.set_description(f"compiling {ansipad(prg.src[0].arg.name, 40)}")
-          to_program_cache[todo[i][0]] = prg
+          to_program_cache[todo[i][0]] = finalize_program(prg, todo[i][1][1])  # LOCAL PATCH: workers stop at SOURCE
           pbar.update(1)
+        pending = set(pool_idx)
+        if pool is not None:
+          # LOCAL PATCH: bounded wait; a task lost to a dead worker is lowered here instead of hanging the prompt
+          for i, prg in pool_imap_bounded(pool, _compile_kernel, [(j, todo[j][1], ctx) for j in pool_idx]):
+            store(i, prg)
+            pending.discard(i)
+        for j in sorted(pending) + parent_idx: store(*_compile_kernel((j, todo[j][1], ctx)))
     except KeyboardInterrupt:
       if pool is not None: terminate_worker_pool()
       raise

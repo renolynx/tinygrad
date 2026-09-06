@@ -1,8 +1,8 @@
-import time, inspect
+import time, inspect, sys, types
 from collections import deque
 from tinygrad.uop.ops import UOp, Ops, UOpMetaClass, rewrite_group, graph_rewrite, gate_kernel_sink, KernelInfo
 from tinygrad.uop.spec import type_verify, spec_tensor
-from tinygrad.helpers import DEBUG, cpu_profile, TracingKey, SPEC, pluralize, SCACHE, BASEDIR, partition, dedup
+from tinygrad.helpers import DEBUG, getenv, cpu_profile, TracingKey, SPEC, pluralize, SCACHE, BASEDIR, partition, dedup
 
 # **** schedule linearizer
 
@@ -130,12 +130,28 @@ def lower_sink_to_linear(function:UOp) -> UOp|None:
     # schedule cache hit
     linear = sc_ret
   if (DEBUG >= 1 and len(linear.src) > 1) or DEBUG >= 3:
-    for frm in inspect.stack():
-      if frm.filename == "<string>": continue
-      if frm.filename.startswith(str(BASEDIR / "apps")): break
-      if not frm.filename.startswith(str(BASEDIR)) and not frm.filename.endswith("/contextlib.py"): break
+    # LOCAL PATCH #28 (2026-09-04): inspect.stack() builds a full FrameInfo for EVERY frame, which reads and caches
+    # the source file of each one. It runs here only to name the caller in a DEBUG>=1 log line, and it dominated the
+    # host time of a host-bound model: profiling SeedVR2's DiT showed 953 calls costing 14.3 s of a 59 s phase, via
+    # 60k inspect.getframeinfo and 20M inspect.ismodule calls. Walk the frames directly instead - same answer, no
+    # source reading. TINY_SLOW_STACK=1 restores the original.
+    if getenv("TINY_SLOW_STACK", 0):
+      for frm in inspect.stack():
+        if frm.filename == "<string>": continue
+        if frm.filename.startswith(str(BASEDIR / "apps")): break
+        if not frm.filename.startswith(str(BASEDIR)) and not frm.filename.endswith("/contextlib.py"): break
+      else:
+        frm = None
     else:
-      frm = None
+      f, frm = sys._getframe(1), None
+      while f is not None:
+        fn = f.f_code.co_filename
+        if fn != "<string>":
+          if fn.startswith(str(BASEDIR / "apps")): break
+          if not fn.startswith(str(BASEDIR)) and not fn.endswith("/contextlib.py"):
+            frm = types.SimpleNamespace(filename=fn, lineno=f.f_lineno)
+            break
+        f = f.f_back
     print(f"scheduled {len(linear.src):5d} kernels in {(time.perf_counter()-st)*1000:8.2f} ms"+\
           f" | {' cache hit' if SCACHE and sc_ret is not None else 'CACHE MISS'} {cache_key.hex()[:8]}"+\
           f" | {len(UOpMetaClass.ucache):7d} uops in cache"+("" if frm is None else f" | {frm.filename}:{frm.lineno}"))

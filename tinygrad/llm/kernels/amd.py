@@ -4,8 +4,9 @@ from typing import Callable, cast
 from tinygrad import Tensor, UOp, nn, Device, Context
 from tinygrad.device import Buffer
 from tinygrad.dtype import AddrSpace, dtypes
-from tinygrad.helpers import prod
+from tinygrad.helpers import prod, getenv
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
+from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_gemm_config, nv_f16_gemm  # LOCAL PATCH #19
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 16
@@ -14,7 +15,13 @@ WMMA_ACC, THREADS_PER_BLOCK = WMMA_M // LANES_PER_WAVE_M, WARP_SIZE * WAVES_M * 
 LDS_PAD, WMMA_ARG, LOG2E = 4, ((WMMA_M, WMMA_N, WMMA_K), 'AMD', 32), math.log2(math.e)
 Q4_K, Q5_K, Q6_K, IQ4_XS, GGML_BLOCK_SIZE, Q8_GROUP_SIZE, Q4_WORDS, Q5_WORDS, Q6_BYTES, IQ4_WORDS = 12, 13, 14, 23, 256, 32, 36, 44, 210, 34
 Q6_PADDED, Q6_WORDS = 212, 53  # the 210-byte Q6 blocks are padded to 212 bytes so they are word-addressable
+IQ3_S, IQ3_HALFWORDS = 21, 55  # LOCAL PATCH #22 (NV only): 110-byte blocks, read through a uint16 view (2-byte aligned)
 QUANT_SIZES = {Q4_K: Q4_WORDS*4, Q5_K: Q5_WORDS*4, Q6_K: Q6_BYTES, IQ4_XS: IQ4_WORDS*4}  # bytes per 256-weight block
+
+# LOCAL PATCH #20 (2026-09-02, LLM_NV_Q8=1): the q8-activation DECODE kernels below also build for NV. The three
+# RDNA3-specific pieces (ds_swizzle warp reduce, v_perm_b32, the dp4a) get NV forms, everything else is plain UOps.
+# _TARGET is set by Linear.__call__ before a kernel is built and is part of every cached builder's key.
+_TARGET = "AMD"
 
 def kernel_var(x:UOp) -> UOp:
   # a Variable is a 0-d ALU BUFFER in the tensor graph; inside kernels it takes the ALU PARAM form (same name keeps the value binding)
@@ -36,7 +43,8 @@ def amd_custom_kernels_supported(device:str|tuple[str, ...]|None) -> bool:
 def warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
   for offset in ((16, 8, 4, 2, 1) if full_wave else (8, 4, 2, 1)):
     if val.op is Ops.INDEX and val.addrspace == AddrSpace.REG: val = val.load()
-    other = UOp(Ops.CUSTOM, src=(val,), arg=
+    if _TARGET == "NV": other = UOp(Ops.CUSTOM, src=(val,), arg=(f"__shfl_xor_sync(0xffffffffu, {{0}}, {offset})", val.dtype))
+    else: other = UOp(Ops.CUSTOM, src=(val,), arg=
       (f"__builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, {{0}}), {0x1f | offset<<10}))", dtypes.float))
     val = val.maximum(other) if maximum else val + other
   return val
@@ -54,17 +62,20 @@ class Linear(nn.Linear):
     super().__init__(in_features, out_features, bias)
     self.in_features, self.out_features = in_features, out_features
   def set_quantized(self, decoded:Tensor):
-    packed_sizes = {decoded.numel() // 256 * type_size:typ for typ,type_size in QUANT_SIZES.items()}
+    sizes = QUANT_SIZES | ({IQ3_S: IQ3_HALFWORDS*2} if _TARGET == "NV" and getenv("LLM_NV_IQ3S", 0) else {})
+    packed_sizes = {decoded.numel() // 256 * type_size:typ for typ,type_size in sizes.items()}
     graph = decoded.uop.toposort()
     raw = next((u for u in graph if u.op is Ops.SHRINK and u.dtype == dtypes.uint8 and prod(u.shape) in packed_sizes), None)
     if raw is None: return
     ggml_type = packed_sizes[prod(raw.shape)]
+    if ggml_type == IQ3_S and not any(u.op is Ops.BUFFER and u.dtype == dtypes.float32 and prod(u.shape) == 2048 for u in graph): return  # Q3_K, same rate
     # the packed byte rate alone can't distinguish same-rate formats (Q4_0 vs Q4_K, Q5_0 vs Q5_K, MXFP4 vs IQ4_XS).
     # the supported formats are 256-wide superblocks: their decode views the packed bytes at the superblock width
     # (ggml_data_to_tensor reshapes to (-1, QUANT_SIZES[type])), while same-rate 32-wide formats reshape to 17-22
-    if not any(u.op is Ops.RESHAPE and u.shape[-1:] == (QUANT_SIZES[ggml_type],) for u in graph): return
+    if not any(u.op is Ops.RESHAPE and u.shape[-1:] == (sizes[ggml_type],) for u in graph): return
     raw_offset = raw.contiguous_view_offset()
     assert raw_offset is not None and raw_offset % 4 == 0 and raw.buf_uop.dtype == dtypes.uint8
+    if _TARGET == "NV" and raw_offset % 16 and ggml_type not in (Q6_K, IQ3_S): return  # NV vector loads need 16-byte alignment (GGUF data is 32-aligned)
     self.ggml_type = ggml_type
     # store a typed buffer view: a lazy BITCAST is decomposed into byte-combining ALU before custom-kernel
     # scheduling and would copy the entire packed weight on every JIT graph
@@ -73,33 +84,87 @@ class Linear(nn.Linear):
       # (a one-time copy at load) so the kernel can do all its reads as aligned u32 words
       nbytes, nblocks = raw.max_numel(), raw.max_numel() // Q6_BYTES
       byte_view = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer).view(nbytes, dtypes.uint8, raw_offset)))
-      padded = byte_view.reshape((nblocks, Q6_BYTES)).pad_to((nblocks, Q6_PADDED)).contiguous().realize()
-      self.weight = Tensor(UOp.from_buffer(cast(Buffer, padded.uop.buf_uop.buffer).view(nblocks * Q6_WORDS, dtypes.uint32, 0)))
+      # NV (patch #20): 224-byte blocks so the kernel's 16-byte vector loads stay 16-byte aligned (NVIDIA faults on
+      # misaligned vector loads, RDNA3 buffer loads do not care)
+      q6_padded, q6_words = (Q6_PADDED, Q6_WORDS) if _TARGET == "AMD" else (224, 56)
+      # the first call of a layer happens inside the block's @function trace (ALLOW_DEVICE_USAGE=0); the one-time repack
+      # is a real buffer that the trace then captures as an implicit input
+      with Context(ALLOW_DEVICE_USAGE=1): padded = byte_view.reshape((nblocks, Q6_BYTES)).pad_to((nblocks, q6_padded)).contiguous().realize()
+      packed = Tensor(UOp.from_buffer(cast(Buffer, padded.uop.buf_uop.buffer).view(nblocks * q6_words, dtypes.uint32, 0)))
+    elif ggml_type == IQ3_S:  # 110-byte blocks are only 2-byte aligned: a uint16 view, no repack (3.3 GB of the 27B is IQ3_S)
+      packed = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer).view(raw.max_numel() * raw.dtype.itemsize // 2, dtypes.uint16, raw_offset)))
+      with Context(ALLOW_DEVICE_USAGE=1): self.iq3s_grid = iq3s_grid(str(decoded.device)).realize()
     else:
-      self.weight = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer)
+      packed = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer)
         .view(raw.max_numel() * raw.dtype.itemsize // dtypes.uint32.itemsize, dtypes.uint32, raw_offset)))
+    # AMD: every call uses the packed view. NV (patch #20): only decode does, prefill keeps the lazy dequant weight
+    setattr(self, "weight" if _TARGET == "AMD" else "raw_weight", packed)
   def __call__(self, x:Tensor) -> Tensor:
-    supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
+    global _TARGET
+    amd = amd_custom_kernels_supported(self.weight.device)
+    # LOCAL PATCH #20: NV runs the q8 decode kernels for single-token calls; prefill stays on patches #18/#19
+    nv_q8 = not amd and bool(getenv("LLM_NV_Q8", 0)) and nv_custom_kernels_supported(self.weight.device)
+    _TARGET = "NV" if nv_q8 else "AMD"
+    supported = self.use_custom_quant and (amd or nv_q8)
     if self.ggml_type is None and supported:
       self.set_quantized(self.weight)
       if self.ggml_type is None:
         # tiny dense fp16 matmul (e.g. the ssm beta/alpha head rows): single fp16 gemv kernel instead of a
         # generic matmul schedule, and realize the densely packed weight once if it is still a lazy ggml view
-        if self.weight.dtype in (dtypes.half, dtypes.float, dtypes.bfloat16) and self.out_features <= 2048 \
+        if amd and self.weight.dtype in (dtypes.half, dtypes.float, dtypes.bfloat16) and self.out_features <= 2048 \
           and self.in_features % (WARP_SIZE*4) == 0:
           numel, max_shape = x.numel(), x.max_shape
           if isinstance(numel, int) or prod(max_shape) // self.in_features <= 32:
             out = f16_gemv(self, x if isinstance(numel, int) else x.pad_to(max_shape))
             return out if isinstance(numel, int) else out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
         self.use_custom_quant = supported = False  # not a supported quant format
-    if self.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS) and supported:
+    if (self.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS) or (self.ggml_type == IQ3_S and _TARGET == "NV")) and supported \
+        and (amd or (x.ndim >= 2 and resolve(x.shape[-2] == 1, False))):
       if isinstance(x.numel(), int): return q8_linear(self, x)
       # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
       out = q8_linear(self, x.pad_to(x.max_shape))
       return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+    # LOCAL PATCH (2026-09-02, LLM_DEQUANT_ONCE=1): on devices without the custom kernels the generic path fuses the GGUF
+    # dequant into the matmul, which is fine for one token (memory-bound) but recomputes the dequant per token for a
+    # prefill chunk: measured on the 4080 with LLM_CHUNK=32, the T=32 fused kernels read weights at ~25 GB/s (compute-bound)
+    # and a chunk cost ~23 decode steps. For multi-token calls, dequantize once into an fp16 temp inside the graph and run a
+    # plain fp16-in / fp32-accumulate matmul (tensor-core eligible). One-token calls (decode, the LM head) keep the fused path.
+    if getenv("LLM_DEQUANT_ONCE", 0) and self.weight.dtype == dtypes.half and x.ndim >= 2 and resolve(x.shape[-2] != 1, True) \
+        and self.weight.numel() <= getenv("LLM_DEQUANT_MAX", 200_000_000):
+      # the temp must depend on this block's input: @function hoists a CONTIGUOUS whose slice has no PARAM out of the block
+      # as an implicit input (function.py pm_ctx), which put every layer's fp16 weight in the caller's graph at once and OOMed
+      # the 27B. (s != s) on a float scalar of x is False and is not folded by the simplifier (that rule is ints-only).
+      s = x.reshape(-1)[:1].reshape(1, 1).cast(dtypes.half)
+      w = (s != s).where(0, self.weight).contiguous()
+      xh = x.cast(dtypes.half)
+      # LOCAL PATCH #19 (2026-09-02, LLM_NV_TC=1): on NV run the padded fp16 matmul through the hand-written tensor-core
+      # GEMM in kernels/nv.py (mma.sync, 16-byte weight streaming at ~600 GB/s vs ~320 GB/s for the beam-tuned generic
+      # kernel). Same padding/shrink as below; the custom kernel is opaque so the shrink cannot be pushed into it.
+      symbolic = not isinstance(x.numel(), int)
+      full_shape = x.max_shape if symbolic else x.shape
+      m_rows = prod(full_shape[:-1])
+      if getenv("LLM_NV_TC", 0) and isinstance(m_rows, int) and nv_custom_kernels_supported(self.weight.device) \
+          and nv_gemm_config(m_rows, self.out_features, self.in_features) is not None:
+        xp = (xh.pad_to(x.max_shape) if symbolic else xh).reshape(m_rows, self.in_features).contiguous()
+        out = nv_f16_gemm(xp, w)
+        if self.bias is not None: out = out + self.bias
+        out = out.reshape(*full_shape[:-1], self.out_features)
+        if symbolic: out = out.shrink(tuple((0, sh) for sh in (*x.shape[:-1], self.out_features)))
+        return out.cast(x.dtype)
+      if symbolic:
+        # symbolic token count: pad to the chunk size so the matmul has a static M (tensor cores need static tiles);
+        # the padded rows are garbage and are sliced off, like the AMD q8 path does
+        # .contiguous() BEFORE the shrink: otherwise the scheduler pushes the shrink into the reduce kernel, M becomes
+        # `toks` again and nothing changes (campaign #4, 2026-09-02). The extra copy is 32 x out_features floats.
+        out = xh.pad_to(x.max_shape).linear(w.transpose(), self.bias, dtype=dtypes.float).contiguous()
+        return out.shrink(tuple((0, sh) for sh in (*x.shape[:-1], self.out_features))).cast(x.dtype)
+      return xh.linear(w.transpose(), self.bias, dtype=dtypes.float).cast(x.dtype)
     return super().__call__(x)
 
 def _amd_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
+  if _TARGET == "NV":  # sm_61+ signed-byte dot: bytes of a and b as int8, accumulated into the int32 c
+    return UOp(Ops.CUSTOMI, src=(a.cast(dtypes.uint32), b.cast(dtypes.uint32), c.cast(dtypes.int32)),
+               arg=("__dp4a((int)({}), (int)({}), (int)({}))", dtypes.int32))
   # int8 4-wide dot, widened to scalar multiply-adds (2% decode slower than the sudot4 builtin, but portable)
   for i in range(4):
     av = ((a >> (8*i)) & 255).cast(dtypes.uint8).bitcast(dtypes.int8).int()
@@ -108,6 +173,13 @@ def _amd_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
   return c
 
 def _amd_byte_perm(a:UOp, b:UOp, selectors:UOp) -> UOp:
+  if _TARGET == "NV":
+    # __byte_perm's byte pool is {y:x} (x low) where v_perm_b32's is {src0:src1} (src1 low) -> swap the sources; and CUDA
+    # packs the four 3-bit selectors into the low 16 bits (bits 0-2, 4-6, 8-10, 12-14) where v_perm uses one BYTE per
+    # output byte -> repack. Selector values >= 8 (v_perm specials) never reach the output here (masked to 0-7).
+    sel = selectors.cast(dtypes.uint32)
+    nib = (sel & 7) | ((sel >> 4) & 0x70) | ((sel >> 8) & 0x700) | ((sel >> 12) & 0x7000)
+    return UOp(Ops.CUSTOMI, src=(b.cast(dtypes.uint32), a.cast(dtypes.uint32), nib), arg=("__byte_perm({}, {}, {})", dtypes.uint32))
   return UOp(Ops.CUSTOMI, src=tuple(x.cast(dtypes.uint32) for x in (a, b, selectors)), arg=("__builtin_amdgcn_perm({}, {}, {})", dtypes.uint32))
 
 def _amd_load(ptr:UOp, lanes:int|None=None) -> UOp:
@@ -150,7 +222,7 @@ def iq4_half_lut(device:str) -> Tensor:
                 dtype=dtypes.float16, device=device).bitcast(dtypes.uint32).contiguous()
 
 @functools.cache
-def _q8_quantize_kernel(q:UOp, scale:UOp, xsum:UOp, x:UOp, tokens:int, in_features:int) -> UOp:
+def _q8_quantize_kernel(q:UOp, scale:UOp, xsum:UOp, x:UOp, tokens:int, in_features:int, target:str="AMD") -> UOp:
   groups = in_features//Q8_GROUP_SIZE
   token_group, lane = UOp.range(tokens*groups, 0, axis_type=AxisType.GLOBAL), UOp.range(32, 1, axis_type=AxisType.LOCAL)
   token, group = token_group//groups, token_group%groups
@@ -175,7 +247,7 @@ def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor, 
   q = Tensor.empty(tokens, groups, 8, dtype=dtypes.uint32, device=x.device)
   scale = Tensor.empty(tokens, groups, dtype=dtypes.float32, device=x.device)
   xsum = Tensor.empty(tokens, groups, 2, dtype=dtypes.float32, device=x.device)
-  q, scale, xsum = Tensor.custom_kernel(q, scale, xsum, x, fxn=functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features))[:3]
+  q, scale, xsum = Tensor.custom_kernel(q, scale, xsum, x, fxn=functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features, target=_TARGET))[:3]
   return q, scale, xsum
 
 def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str) -> UOp:
@@ -192,7 +264,7 @@ def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:s
     arg=KernelInfo(name=name, opts_to_apply=()))
 
 @functools.cache
-def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:int, in_features:int, ggml_type:int) -> UOp:
+def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:int, in_features:int, ggml_type:int, target:str="AMD") -> UOp:
   group_count = in_features // Q8_GROUP_SIZE
   def group_dot(token:UOp, output:UOp, group:UOp) -> UOp:
     block, subgroup = group // 8, group % 8
@@ -219,7 +291,7 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:
       d, scale = _iq4_scales(raw, base, subgroup)
       return dot.float() * xd[token, group] * d * scale
     # the packed rows were padded to 212 bytes (53 words) per 256-block in set_quantized: everything is word-aligned
-    base = (output*in_features//GGML_BLOCK_SIZE+block)*Q6_WORDS
+    base = (output*in_features//GGML_BLOCK_SIZE+block)*(Q6_WORDS if _TARGET == "AMD" else 56)  # NV: 224-byte blocks (patch #20)
     # the subgroup's 8 ql words and 8 qh words are contiguous: two 16-byte vector loads each
     lows = tuple(_amd_load(raw[base + (subgroup//4)*16 + (subgroup%2)*8 + half*4], 4) for half in range(2))
     highs = tuple(_amd_load(raw[base + 32 + (subgroup//4)*8 + half*4], 4) for half in range(2))
@@ -329,10 +401,41 @@ def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:i
     return tuple((_half((pair >> (i*16)) & 0xffff)*scale).cast(dtypes.float16) for pair in lut_pairs for i in range(2))
   return _quant_linear_wmma(out, x, out_features, in_features, IQ4_WORDS, layout, dequant, "linear_iq4_xs_f16_wmma")
 
+@functools.cache
+def iq3s_grid(device:str) -> Tensor:
+  from tinygrad.runtime.autogen.ggml_common import iq3s_grid as grid
+  return Tensor(list(grid), dtype=dtypes.uint32, device=device).contiguous()
+
+@functools.cache
+def _iq3s_decode_kernel(out:UOp, raw16:UOp, xq:UOp, xd:UOp, grid:UOp, out_features:int, in_features:int, target:str="NV") -> UOp:
+  """LOCAL PATCH #22: q8-activation decode over IQ3_S blocks (d:2, qs:64, qh:8, signs:32, scales:4 = 110 bytes per 256
+  weights) read as uint16 halfwords. A 32-group is 8 grid entries of 4 magnitudes (iq3s_grid, 1..15), a sign bit per
+  weight and one 4-bit scale: value = d * (1 + 2*scale) * sign * magnitude."""
+  group_count = in_features // Q8_GROUP_SIZE
+  def group_dot(token:UOp, output:UOp, group:UOp) -> UOp:
+    block, g = group // 8, group % 8
+    hb = (output * (in_features // GGML_BLOCK_SIZE) + block) * IQ3_HALFWORDS
+    xwords = _amd_load(xq[token, group, 0], 8)
+    qs = tuple(raw16[hb + 1 + 4*g + i].load().cast(dtypes.uint32) for i in range(4))     # bytes 2+8g .. 2+8g+7
+    qh = (raw16[hb + 33 + g//2].load().cast(dtypes.uint32) >> ((g % 2) * 8).cast(dtypes.uint32)) & 255   # byte 66+g
+    sg = tuple(raw16[hb + 37 + 2*g + i].load().cast(dtypes.uint32) for i in range(2))     # bytes 74+4g .. 74+4g+3
+    sc = (raw16[hb + 53 + g//4].load().cast(dtypes.uint32) >> (((g//2) % 2) * 8 + (g % 2) * 4).cast(dtypes.uint32)) & 15  # byte 106+g//2
+    d = _half(raw16[hb].load().cast(dtypes.uint32))
+    dot = UOp.const(0, dtypes.int32)
+    for i in range(8):
+      idx = ((qs[i//2] >> ((i % 2) * 8)) & 255) | (((qh >> i) & 1) << 8)
+      mag = grid[idx.cast(dtypes.weakint)].load()                       # 4 magnitude bytes
+      s4 = (sg[i//4] >> (((i//2) % 2) * 8 + (i % 2) * 4)) & 15          # sign bits of the entry's 4 weights (1 = negative)
+      m = ((s4 * 0x204081) & 0x01010101) * 0xFF                          # spread to byte masks
+      word = (mag ^ m) + (m & 0x01010101)                                # two's complement negate the flagged bytes
+      dot = _amd_dp4a(word, xwords[i], dot)
+    return dot.float() * xd[token, group] * d * (sc * 2 + 1).float()
+  return _decode_linear(out, out_features, group_count, group_dot, "linear_iq3_s")
+
 def q8_linear(layer:Linear, x:Tensor) -> Tensor:
-  assert layer.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS)
+  assert layer.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS, IQ3_S)
   tokens = int(x.numel()) // layer.in_features
-  raw, out_features, in_features = layer.weight.uop.buf_uop, layer.out_features, layer.in_features
+  raw, out_features, in_features = getattr(layer, "raw_weight", layer.weight).uop.buf_uop, layer.out_features, layer.in_features
   def run(fxn:Callable[..., UOp], out:UOp, *srcs:UOp) -> Tensor:
     all_srcs = (out,)+srcs
     params = tuple(UOp.placeholder_like(src, slot=i) for i,src in enumerate(all_srcs))
@@ -342,13 +445,17 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
     result = result.reshape(*x.shape[:-1], out_features)
     return result if layer.bias is None else result + layer.bias
   out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device).uop
-  if tokens % 16 == 0 and out_features % 16 == 0 and layer.ggml_type in (Q4_K, Q5_K, IQ4_XS):
+  if tokens % 16 == 0 and out_features % 16 == 0 and layer.ggml_type in (Q4_K, Q5_K, IQ4_XS) and _TARGET == "AMD":
     fxn = _iq4_linear_f16_wmma_kernel if layer.ggml_type == IQ4_XS else functools.partial(_q5_linear_f16_wmma_kernel, ggml_type=layer.ggml_type)
     extra = (iq4_half_lut(str(x.device)).uop,) if layer.ggml_type == IQ4_XS else ()
     return run(fxn, out, raw, x.cast(dtypes.float16).contiguous().uop, *extra)
   xq_, xd, xs = q8_quantize(x, tokens, in_features)
-  decode = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type)
   out = Tensor.empty(tokens, out_features, (in_features+1023)//1024, dtype=dtypes.float32, device=x.device).uop
+  if layer.ggml_type == IQ3_S:
+    # no xs input: IQ3_S has no min offset, and an UNUSED kernel parameter breaks the JIT replay's argument mapping
+    # (the eager call is fine, the replayed one reads the wrong buffer - found 2026-09-02 with nv_iq3s_jit_probe.py)
+    return run(functools.partial(_iq3s_decode_kernel, target=_TARGET), out, raw, xq_.uop, xd.uop, layer.iq3s_grid.uop)
+  decode = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type, target=_TARGET)
   return run(decode, out, raw, xq_.uop, xd.uop, xs.uop)
 
 # ******** tiny dense fp16 gemv ********
@@ -604,7 +711,7 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
 # ******** gated delta net: fused recurrent scan ********
 
 @functools.cache
-def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, kq:UOp, start_pos:UOp|None=None) -> UOp:
+def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, kq:UOp, start_pos:UOp|None=None, target:str="AMD") -> UOp:
   batch, heads, tokens, value_dim, row_tile = *core.shape, 4
   key_dim, alpha_dim = q.shape[-1], alpha.shape[-1] if len(alpha.shape) == 4 else 1
   assert all(isinstance(x, int) for x in (batch, heads, tokens, value_dim, key_dim)) and key_dim % 32 == 0 and value_dim % row_tile == 0
@@ -638,6 +745,9 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
   return UOp.group(*state_stores).end(lane, bh_row).sink(arg=KernelInfo(name="gated_delta_prefill", opts_to_apply=()))
 
 def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor, state:Tensor, start_pos:Tensor|None=None) -> Tensor:
+  # LOCAL PATCH #21 (2026-09-02): the scan kernel is plain UOps + warp_reduce, so it also builds for NV (LLM_NV_SCAN=1)
+  global _TARGET
+  _TARGET = "AMD" if amd_custom_kernels_supported(q.device) else "NV"
   batch, heads, tokens, key_dim = q.shape
   value_dim = v.shape[-1]
   assert q.shape == k.shape and v.shape[:3] == beta.shape == (batch, heads, tokens) and state.shape == (batch, heads, value_dim, key_dim)
@@ -645,10 +755,10 @@ def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor,
   assert key_dim % 32 == 0 and value_dim % 4 == 0
   core, kq = Tensor.empty_like(v), (q*k).sum(-1).contiguous()
   srcs = (core, q.contiguous(), k.contiguous(), v.contiguous(), beta.contiguous(), alpha.contiguous(), state, kq)
-  if start_pos is None: return Tensor.custom_kernel(*srcs, fxn=_gated_delta_prefill_kernel)[0]
+  if start_pos is None: return Tensor.custom_kernel(*srcs, fxn=functools.partial(_gated_delta_prefill_kernel, target=_TARGET))[0]
   contig = tuple(x.uop if x.uop.op is Ops.AFTER else x.uop.contiguous() for x in srcs)
   params = tuple(UOp.placeholder_like(x, slot=i) for i,x in enumerate(contig))
   assert start_pos.uop.is_bound_var
   # the bound start_pos reaches the graph through the state AFTER chain, like the flash kernels' valid_end
-  call = _gated_delta_prefill_kernel(*params, kernel_var(start_pos.uop.src[0])).call(*contig)
+  call = _gated_delta_prefill_kernel(*params, kernel_var(start_pos.uop.src[0]), target=_TARGET).call(*contig)
   return Tensor(contig[0].after(call))

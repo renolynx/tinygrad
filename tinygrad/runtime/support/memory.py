@@ -280,11 +280,26 @@ class MemoryManager:
     self.va_allocator.free(vm.va_addr)
     for paddr, _ in vm.paddrs: self.pfree(paddr)
 
+  # LOCAL PATCH #30 (2026-09-04): page-table pages carry a host-side write-through shadow (see
+  # NVPageTableEntry). A shadow is only ever valid while the page IS a page table, so it is dropped
+  # when that physical page is freed or overwritten with zeros by a later allocation.
+  def _drop_pt_shadow(self, paddr:int, size:int=0x1000):
+    if not (shadows:=getattr(self.dev, "_pt_shadow", None)): return
+    if size <= 0x1000: shadows.pop(paddr, None)
+    elif size // 0x1000 <= len(shadows):
+      for pg in range(paddr, paddr + size, 0x1000): shadows.pop(pg, None)
+    else:
+      for pg in [k for k in shadows if paddr <= k < paddr + size]: shadows.pop(pg, None)
+
   def palloc(self, size:int, align:int=0x1000, zero=True, boot=False, ptable=False) -> int:
     assert self.dev.is_booting == boot, "During booting, only boot memory can be allocated"
     allocator = self.boot_allocator if boot else (self.ptable_allocator if self.reserve_ptable and ptable else self.pa_allocator)
     paddr = allocator.alloc(round_up(size, 0x1000), align)
-    if zero: self.dev.vram[paddr:paddr+size] = bytes(size)
+    if zero:
+      self.dev.vram[paddr:paddr+size] = bytes(size)
+      self._drop_pt_shadow(paddr, round_up(size, 0x1000))
     return paddr
 
-  def pfree(self, paddr:int, ptable=False): (self.ptable_allocator if self.reserve_ptable and ptable else self.pa_allocator).free(paddr)
+  def pfree(self, paddr:int, ptable=False):
+    self._drop_pt_shadow(paddr)
+    (self.ptable_allocator if self.reserve_ptable and ptable else self.pa_allocator).free(paddr)

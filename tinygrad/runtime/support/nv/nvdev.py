@@ -1,5 +1,5 @@
 from __future__ import annotations
-import time, functools, tinygrad.runtime.autogen.nv_regs
+import time, functools, array, tinygrad.runtime.autogen.nv_regs
 from tinygrad.helpers import getenv, DEBUG, getbits, round_up
 from tinygrad.runtime.autogen import pci
 from tinygrad.runtime.support.memory import TLSFAllocator, MemoryManager, AddrSpace
@@ -8,6 +8,8 @@ from tinygrad.runtime.support.system import PCIDevice
 from tinygrad.runtime.support.hcq import MMIOInterface
 
 NV_DEBUG = getenv("NV_DEBUG", 0)
+NV_PT_SHADOW_VERIFY = getenv("NV_PT_SHADOW_VERIFY", 0)   # patch #30 self-check
+NV_PT_SHADOW = getenv("NV_PT_SHADOW", 1)                 # patch #30 off switch (NV_PT_SHADOW=0 = upstream behaviour)
 
 class NVReg:
   def __init__(self, nvdev, base, off, fields=None): self.nvdev, self.base, self.off, self.fields = nvdev, base, off, fields
@@ -31,7 +33,22 @@ class NVReg:
   def decode(self, val: int) -> dict: return {name:getbits(val, start, end) for name,(start,end) in self.fields.items()}
 
 class NVPageTableEntry:
-  def __init__(self, nvdev, paddr, lv): self.nvdev, self.paddr, self.lv, self.entries = nvdev, paddr, lv, nvdev.vram.view(paddr, 0x1000, fmt='Q')
+  # ******** LOCAL PATCH #30 (2026-09-04): host-side shadow of every page-table page ********
+  # self.entries is a view into device vram. On the USB4/TinyGPU stack that view is a RemotePCIDevice
+  # MMIO window, so reading ONE 8-byte entry is a synchronous socket round trip to TinyGPU.app.
+  # map_range/unmap_range read every PTE they touch (the "already mapped" inspection pass, the
+  # unmap asserts, and _try_free_pt's 512-entry emptiness scan), which measured 650k reads per 20s
+  # = 35% of the wall clock of a SeedVR2 2048px DiT pass. Nothing but this process ever writes these
+  # pages - the MMU only reads them - so a write-through host copy is exact. Reads come from the
+  # shadow; the first touch of a page costs ONE bulk read of the whole 4 KB instead of up to 512.
+  # The shadow is dropped when the page is freed or zeroed (see MemoryManager.palloc/pfree).
+  def __init__(self, nvdev, paddr, lv):
+    self.nvdev, self.paddr, self.lv, self.entries = nvdev, paddr, lv, nvdev.vram.view(paddr, 0x1000, fmt='Q')
+    try: shadows = nvdev._pt_shadow
+    except AttributeError: shadows = nvdev._pt_shadow = {}
+    if not NV_PT_SHADOW: self.shadow = self.entries; return
+    if (sh:=shadows.get(paddr)) is None: shadows[paddr] = sh = array.array('Q', self.entries[:])
+    self.shadow = sh
 
   def _is_dual_pde(self) -> bool: return self.lv == self.nvdev.mm.level_cnt - 2
 
@@ -45,11 +62,18 @@ class NVPageTableEntry:
       x = pde.encode(is_pte=False, **{f'aperture{small}': 1 if valid else 0, f'address{small}{sys}': paddr >> 12},
         **({f'pcf{small}': 0b10} if self.nvdev.mmu_ver == 3 else {'no_ats': 1}))
 
-    if self._is_dual_pde(): self.entries[2*entry_id], self.entries[2*entry_id+1] = x & 0xffffffffffffffff, x >> 64
+    if self._is_dual_pde():
+      self.entries[2*entry_id], self.entries[2*entry_id+1] = x & 0xffffffffffffffff, x >> 64
+      if self.shadow is not self.entries: self.shadow[2*entry_id], self.shadow[2*entry_id+1] = x & 0xffffffffffffffff, x >> 64   # patch #30
+    elif self.shadow is not self.entries: self.entries[entry_id] = self.shadow[entry_id] = x
     else: self.entries[entry_id] = x
 
-  def entry(self, entry_id:int) -> int:
-    return (self.entries[2*entry_id+1]<<64) | self.entries[2*entry_id] if self._is_dual_pde() else self.entries[entry_id]
+  def entry(self, entry_id:int) -> int:   # patch #30: served from the host shadow, never the device
+    v = (self.shadow[2*entry_id+1]<<64) | self.shadow[2*entry_id] if self._is_dual_pde() else self.shadow[entry_id]
+    if NV_PT_SHADOW_VERIFY:   # NV_PT_SHADOW_VERIFY=1: read the device too and prove the shadow never diverges
+      d = (self.entries[2*entry_id+1]<<64) | self.entries[2*entry_id] if self._is_dual_pde() else self.entries[entry_id]
+      assert d == v, f"pt shadow mismatch pt={self.paddr:#x} lv={self.lv} entry={entry_id}: shadow={v:#x} device={d:#x}"
+    return v
 
   def read_fields(self, entry_id:int) -> dict:
     if self.is_page(entry_id): return self.nvdev.pte_t.decode(self.entry(entry_id))
@@ -59,8 +83,15 @@ class NVPageTableEntry:
   def supports_huge_page(self, paddr:int): return self.lv >= self.nvdev.mm.level_cnt - 3 and paddr % self.nvdev.mm.pte_covers[self.lv] == 0
 
   def valid(self, entry_id):
-    if self.is_page(entry_id): return self.read_fields(entry_id)['valid']
-    return self.read_fields(entry_id)['aperture_small' if self._is_dual_pde() else 'aperture'] != 0
+    if not NV_PT_SHADOW:   # upstream path, kept so NV_PT_SHADOW=0 reverts the whole patch
+      if self.is_page(entry_id): return self.read_fields(entry_id)['valid']
+      return self.read_fields(entry_id)['aperture_small' if self._is_dual_pde() else 'aperture'] != 0
+    # patch #30: one entry read and one getbits instead of two reads and a full decode() dict of every
+    # field - map/unmap call this millions of times per image and the dict was pure garbage.
+    v = self.entry(entry_id)
+    if (v & 1 == 1) if self.lv < self.nvdev.mm.level_cnt - 1 else True: return getbits(v, *self.nvdev.pte_t.fields['valid'])
+    dual = self._is_dual_pde()
+    return getbits(v, *(self.nvdev.dual_pde_t if dual else self.nvdev.pde_t).fields['aperture_small' if dual else 'aperture']) != 0
 
   def address(self, entry_id:int) -> int:
     small, sys = ("_small" if self._is_dual_pde() else ""), "_sys" if self.nvdev.mmu_ver == 2 or self.lv == self.nvdev.mm.level_cnt - 1 else ""
@@ -142,8 +173,17 @@ class NVDev:
     # 5           PTE_64K / PTE_4K                    20:16 / 20:12
     bits, shifts = (56, [12, 21, 29, 38, 47, 56]) if self.mmu_ver == 3 else (48, [12, 21, 29, 38, 47])
 
-    # tail vram reserved for falcon structs
-    self.mm = NVMemoryManager(self, self.vram_size - (64 << 20), boot_size=(2 << 20), pt_t=NVPageTableEntry, va_bits=bits, va_shifts=shifts,
+    # Tail vram reserved for falcon structs and for the GSP firmware.
+    #
+    # 64 MB (the previous value) is not enough. NV_GSP.init_wpr_meta (support/nv/ip.py) carves the *top* of vram for the GSP: a 1 MB VGA
+    # workspace, 1 MB of FRTS, the bootloader, the radix3 GSP ELF, and gspFwHeapSize = 0x8100000 (129 MB), with gspFwRsvdStart marking the
+    # bottom of the whole block. Measured on ad102 (RTX 4080 Super) gspFwRsvdStart lands 194 MB below the top of vram, so a 64 MB reservation
+    # leaves ~130 MB of GSP-owned memory inside pa_allocator, free to be handed out as tensor storage. A shader writing there takes an MMU
+    # NV_PFAULT_FAULT_TYPE_REGION_VIOLATION, which reaches the user as the bare "Device fault detected" from PCIIface.sleep.
+    #
+    # The exact sizes are firmware-dependent and are not known this early (the images have not been fetched yet), so reserve a bound that
+    # covers them. 256 MB is 1.5% of a 16 GB card.
+    self.mm = NVMemoryManager(self, self.vram_size - (256 << 20), boot_size=(2 << 20), pt_t=NVPageTableEntry, va_bits=bits, va_shifts=shifts,
       va_base=0, palloc_ranges=[(x, x) for x in [512 << 20, 2 << 20, 4 << 10]], reserve_ptable=not self.large_bar)
 
   def _alloc_boot_mem(self, size:int, data:bytes|None=None, contiguous:bool=False, sysmem:bool|None=None) -> tuple[MMIOInterface,int|None,list[int]]:

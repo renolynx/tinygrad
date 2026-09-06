@@ -1,6 +1,6 @@
 from __future__ import annotations
 import os, mmap, array, functools, ctypes, ctypes.util, select, contextlib, dataclasses, sys, itertools, struct, socket
-import subprocess, time, enum, atexit
+import subprocess, time, enum, atexit, threading
 from tinygrad.helpers import round_up, getenv, OSX, temp, ceildiv, unwrap, fetch, system, _ensure_downloads_dir, DEBUG, flatten, pluralize
 from tinygrad.runtime.autogen import libc, pci, vfio
 from tinygrad.runtime.support.hcq import FileIOInterface, MMIOInterface, HCQBuffer, hcq_filter_visible_devices
@@ -377,10 +377,14 @@ class RemotePCIDevice(PCIDevice):
     sock.sendall(struct.pack('<BIIQQQ', cmd, dev_id, bar, *(*args, 0, 0, 0)[:3]) + payload)
     if has_fd:
       msg, anc, _, _ = sock.recvmsg(17, socket.CMSG_LEN(4))
-      fd = struct.unpack('<i', anc[0][2][:4])[0]
+      # parse the status BEFORE touching ancillary data: an error response carries no fd,
+      # and unpacking the missing fd first raises a bare IndexError that hides the real error
+      fd = struct.unpack('<i', anc[0][2][:4])[0] if anc else None
     else: msg, fd = RemotePCIDevice._recvall(sock, 17), None
     if (resp:=struct.unpack('<BQQ', msg))[0] != 0:
       raise RuntimeError(f"RPC failed: {RemotePCIDevice._recvall(sock, resp[1]).decode('utf-8') if resp[1] > 0 else 'unknown error'}")
+    if has_fd and fd is None:
+      raise RuntimeError("RPC succeeded but no fd was attached (SCM_RIGHTS truncated - receiver fd limit?)")
     RemotePCIDevice._rpc_count += 1
     return (resp[1], resp[2]) + ((RemotePCIDevice._recvall(sock, readout_size) if readout_size > 0 else None),) + (fd,)
 
@@ -437,11 +441,34 @@ class APLRemotePCIDevice(RemotePCIDevice):
       time.sleep(0.05)
     else: raise RuntimeError(f"Failed to connect to TinyGPU server at {sock_path}.")
     super().__init__(devpref, "usb4", sock=sock)
+    self._slab_view, self._slab_paddrs, self._slab_off, self._slab_size = None, None, 0, 0
+    self._slab_lock = threading.Lock()
 
-  def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
+  # The TinyGPU helper has a small fixed table of sysmem mappings (measured: a fresh
+  # process gets ~85 more MAP_SYSMEM_FD calls before "RPC failed"), and there is no
+  # unmap command at all - every mapping is process-lifetime. Eager mode stays under
+  # the cap only through LRU reuse; building an HCQ graph allocates a few dozen more
+  # and dies. Since frees never reach the helper anyway, small allocations are bump-
+  # allocated out of large slab mappings: identical semantics, ~1/1000th the slots.
+  SLAB_CHUNK = 32 << 20
+
+  def _alloc_sysmem_direct(self, size:int, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
     mapped_size, _, _, fd = self._rpc(self.sock, self.dev_id, RemoteCmd.MAP_SYSMEM_FD, size, int(contiguous), has_fd=True)
     memview = MMIOInterface(FileIOInterface(fd=fd).mmap(0, mapped_size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, 0), mapped_size, fmt='B')
 
     # paddrs are returned as (paddr, size) pairs until a (paddr=0, size=0) terminator in the beginning of the mapping.
     paddrs_raw = list(itertools.takewhile(lambda p: p[1] != 0, zip(memview.view(fmt='Q')[0::2], memview.view(fmt='Q')[1::2])))
     return memview, [p + i for p, sz in paddrs_raw for i in range(0, sz, 0x1000)][:ceildiv(size, 0x1000)]
+
+  def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
+    size = round_up(size, 0x1000)
+    # large or physically-contiguous requests go straight to the helper: one slot each, rare
+    if contiguous or size > (8 << 20): return self._alloc_sysmem_direct(size, contiguous)
+    with self._slab_lock:
+      off = self._slab_off
+      if self._slab_view is None or off + size > self._slab_size:
+        chunk = max(self.SLAB_CHUNK, size)
+        self._slab_view, self._slab_paddrs = self._alloc_sysmem_direct(chunk)
+        self._slab_size, off = chunk, 0
+      self._slab_off = off + size
+      return self._slab_view.view(off, size, fmt='B'), self._slab_paddrs[off // 0x1000:(off + size) // 0x1000]

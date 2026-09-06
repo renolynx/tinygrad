@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from collections import defaultdict
 from typing import Any, Callable, Generic, TypeVar, Iterator, Generator, Self, TYPE_CHECKING
-import importlib, inspect, functools, pathlib, os, contextlib, re, atexit, pickle, decimal, subprocess, struct
+import importlib, inspect, functools, pathlib, os, contextlib, re, atexit, pickle, decimal, subprocess, struct, gc, weakref
 from tinygrad.helpers import LRU, getenv, diskcache_get, diskcache_put, DEBUG, GlobalCounters, PROFILE, temp, colored
 from tinygrad.helpers import Context, CCACHE, ALLOW_DEVICE_USAGE, MAX_BUFFER_SIZE, cpu_events, ProfileEvent, ProfilePointEvent, suppress_finalizing
 from tinygrad.helpers import select_by_name, select_first_inited, DEV, TracingKey, size_to_str, pluralize, Target, unwrap, round_up
@@ -119,6 +119,9 @@ class Buffer:
       assert base._base is None, "base can't have a base"
       assert self.device == base.device, "base must have the same device"
       self._base = base
+      # LOCAL PATCH #31 (2026-09-04): remember our views, so freeing a base can invalidate their cached pointers.
+      if (vs:=getattr(base, "_views", None)) is None: vs = base._views = weakref.WeakSet()
+      vs.add(self)
     if preallocate: self.allocate()
   @property
   def base(self) -> Buffer: return self._base if self._base is not None else self
@@ -171,6 +174,17 @@ class Buffer:
       for dev, mb in self._bufs.items():
         if dev != self.device: Device[dev].allocator._unmap(mb)
       self.allocator.free(self._buf, self.nbytes, self.options)
+      # ******** LOCAL PATCH #31 (2026-09-04): freeing a base must invalidate its views ********
+      # allocate() caches a view's pointer as allocator._offset(base._buf, nbytes, offset) in the VIEW's own _bufs,
+      # and nothing here ever cleared it. is_allocated() delegates to the base, so once the base is re-allocated the
+      # view reports itself initialized and hands a kernel a pointer into the OLD allocation. Harmless while the
+      # freed block comes straight back out of the LRU cache at the same address - which is why this hid for weeks -
+      # and an MMU fault the moment it does not: ComfyUI's memory reclaim calls CapturedJit.free_intermediates()
+      # (buffers to the cache) and then allocator.free_cache() (really unmapped), and the next TinyJit replay wrote
+      # into the unmapped memory-planner arena. Repro: diagnostics/jit_free_replay_repro.py (needs free_intermediates
+      # + free_cache + the planner; NO_MEMORY_PLANNER=1 makes it pass).
+      for v in list(getattr(self, "_views", ()) or ()): v._bufs.clear()
+      self.allocated_views = 0
     elif self._base is not None: self._base.allocated_views -= 1
     self._bufs.clear()
   def __reduce_ex__(self, protocol):
@@ -254,19 +268,56 @@ class LRUAllocator(Allocator, Generic[DeviceType]):
   """
   def __init__(self, dev:DeviceType, **kwargs):
     self.cache: dict[tuple[int, BufferSpec|None], Any] = defaultdict(list)
+    # Local patch #33 (2026-09-05): cap the reuse cache. Uncapped it grows until the card is full, after which every
+    # new size misses, drops the whole cache and refills it - the MiniMax H3 first step took 16 min in ComfyUI against
+    # 75 s with LRU=0. LRU_CAP_MB (default 2048) keeps the cache useful without letting it own the card.
+    self.cached_bytes = 0
+    self.cache_cap = int(getenv("LRU_CAP_MB", 2048)) << 20
     super().__init__(dev, **kwargs)
   def alloc(self, size:int, options:BufferSpec|None=None):
-    if len(c := self.cache[(size, options)]): return c.pop()
+    if len(c := self.cache[(size, options)]):
+      self.cached_bytes -= size
+      return c.pop()
     try: return super().alloc(size, options)
     except (RuntimeError, MemoryError):
+      # Collect before dropping the reuse cache. CPython's cyclic collector is driven by object
+      # *counts*, not by bytes, and a torch tensor on the tiny backend is a handful of tiny python
+      # objects in a reference cycle pinning a multi-MB device buffer, so the collector has no idea
+      # the card is full. Measured under ComfyUI on a 16 GB card: at the point of failure 9.5 GB was
+      # accounted used and a single gc.collect() took that to 2.7 GB. Without this, a second image
+      # in the same process dies with "Allocation of 432.00 MB failed on NV. Used: 15.02 GB".
+      # Local patch #32 (2026-09-05, MiniMax H3 on the 16 GB card): once the reuse cache fills the card every fresh
+      # size misses here, and a gc.collect() over a ComfyUI-sized heap costs seconds - 400 s of a 440 s step were
+      # collections. Drop the cache first (cheap) and only collect when that was not enough.
       self.free_cache()
-      return super().alloc(size, options)
+      try: return super().alloc(size, options)
+      except (RuntimeError, MemoryError):
+        gc.collect()
+        self.free_cache()
+        try: return super().alloc(size, options)
+        except (RuntimeError, MemoryError):
+          # last resort failed: say what is on the card (local patch #32b, 2026-09-05)
+          try:
+            from tinygrad.uop.ops import buffers
+            from collections import Counter
+            sizes: Counter = Counter()
+            for u, b in list(buffers.items()):
+              for x in (b.bufs if hasattr(b, "bufs") else (b,)):
+                if x.device == self.dev.device and x.is_allocated(): sizes[x.nbytes] += 1
+            tot = sum(k*v for k,v in sizes.items())
+            top = ", ".join(f"{k/1e6:.0f}MBx{v}" for k,v in sorted(sizes.items(), key=lambda kv: -kv[0]*kv[1])[:8])
+            print(f"tinygrad OOM on {self.dev.device}: {tot/1e9:.2f} GB in {sum(sizes.values())} registered buffers, top: {top}", flush=True)
+          except Exception as e: print(f"tinygrad OOM report failed: {e!r}", flush=True)
+          raise
   def free_cache(self):
     for (sz,options),opaques in self.cache.items():
       for opaque in opaques: super().free(opaque, sz, options)
       opaques.clear()
+    self.cached_bytes = 0
   def free(self, opaque:Any, size:int, options:BufferSpec|None=None):
-    if LRU and (options is None or (not (options.nolru or options.zero) and options.external_ptr is None)): self.cache[(size, options)].append(opaque)
+    if LRU and (options is None or (not (options.nolru or options.zero) and options.external_ptr is None)) and self.cached_bytes + size <= self.cache_cap:
+      self.cache[(size, options)].append(opaque)
+      self.cached_bytes += size
     else: super().free(opaque, size, options)
 
 class DepsTracker:
@@ -311,12 +362,48 @@ class Compiler:
       if self.cachekey is not None: diskcache_put(self.cachekey, src, lib)
     return lib
   def disassemble(self, lib:bytes): pass
+  @contextlib.contextmanager
+  def _docker_serial(self):
+    # the colima-forwarded docker socket dies under concurrent compile streams (the reason
+    # PARALLEL=0 was mandatory). A cross-process flock serializes container spawns and
+    # compile transactions so the beam worker pool can parallelize the python lowering
+    # while at most one process talks to docker at any moment.
+    import fcntl
+    with open(temp("tinygrad_docker_compile.lock"), "w") as lf:
+      fcntl.flock(lf, fcntl.LOCK_EX)
+      try: yield
+      finally: fcntl.flock(lf, fcntl.LOCK_UN)
+  # LOCAL PATCH (2026-09-01): the docker compile container is spawned lazily, on the first compile, instead of in the
+  # compiler's __init__. Renderer.__reduce__ rebuilds a fresh renderer (and so a fresh compiler) on EVERY unpickle,
+  # and beam/compile pool workers unpickle one per task - measured: 60 orphaned containers, a VM OOM and a dead
+  # colima socket forwarder from a single 512px beam campaign. Workers never compile now (see codegen.in_worker_process),
+  # and a compiler that is never asked to compile never starts a container.
+  _server_args: tuple|None = None
+  @property
+  def compiler_process(self) -> subprocess.Popen:
+    if (p:=self.__dict__.get("_compiler_process")) is None: self.__dict__["_compiler_process"] = p = self.server(*unwrap(self._server_args))
+    return p
+  def compile_via_server(self, src:str) -> bytes:
+    # the container can die under us (VM OOM, docker restart): respawn once and retry before giving up
+    try: return self.compile_server(src, self.compiler_process)
+    except (BrokenPipeError, ConnectionError, struct.error):
+      if DEBUG >= 1: print("compile server died, respawning the docker compile container")
+      if (dead:=self.__dict__.pop("_compiler_process", None)) is not None:
+        with contextlib.suppress(Exception): dead.kill()
+      return self.compile_server(src, self.compiler_process)
   def server(self, cmd:str, arch:str, *args) -> subprocess.Popen:
     argv = f"{cmd} {pathlib.Path(__file__).parent}/runtime/support/compileserver.py {type(self).__module__}:{type(self).__name__} {arch}"
-    return subprocess.Popen(argv.split() + [str(a) for a in args], stdout=subprocess.PIPE, stdin=subprocess.PIPE, bufsize=0)
+    with self._docker_serial():
+      return subprocess.Popen(argv.split() + [str(a) for a in args], stdout=subprocess.PIPE, stdin=subprocess.PIPE, bufsize=0)
   def compile_server(self, src:str, proc:subprocess.Popen) -> bytes:
-    unwrap(proc.stdin).write(struct.pack("I", len(src.encode())) + src.encode())
-    if (lib:=unwrap(proc.stdout).read(struct.unpack("I", unwrap(proc.stdout).read(4))[0])): return lib
+    # stdout is an unbuffered pipe (bufsize=0), so read() can return short. a truncated lib gets cached, so loop until n bytes.
+    def _read(n:int) -> bytes:
+      buf = bytearray()
+      while len(buf) < n and (chunk:=unwrap(proc.stdout).read(n-len(buf))): buf += chunk
+      return bytes(buf)
+    with self._docker_serial():
+      unwrap(proc.stdin).write(struct.pack("I", len(src.encode())) + src.encode())
+      if (lib:=_read(struct.unpack("I", _read(4))[0])): return lib
     raise CompileError("Compilation Error")
 
 

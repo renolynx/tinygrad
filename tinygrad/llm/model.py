@@ -3,6 +3,7 @@ import enum, functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_llm_flash_attention  # LOCAL PATCHES #21/#23
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
 
@@ -184,6 +185,13 @@ class TransformerBlock(FFNBlock):
     store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(dtypes.half).uop)
     assigned_kv = Tensor(self.cache_kv.uop.after(store))
     # on RDNA3, hybrid models use custom flash attention kernels on the KV cache
+    # LOCAL PATCH #23 (2026-09-02): LLM_NV_FLASH=1 runs the hand-written NV flash-attention kernel (kernels/nv.py) on the
+    # KV cache for prefill chunks (decode keeps the generic path); same padding/shrink handling as the AMD kernel
+    if getenv("LLM_NV_FLASH", 0) and nv_custom_kernels_supported(x.device) and self.config.ssm is not None and \
+        (isinstance(T, UOp) or T > 1):
+      attn = nv_llm_flash_attention(q, assigned_kv, start_pos+T)
+      attn = attn.transpose(1, 2).reshape(B, T, -1)
+      return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
     if amd_custom_kernels_supported(x.device) and self.config.ssm is not None:
       attn = flash_attention(q, assigned_kv, start_pos+T)
       attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
@@ -323,7 +331,10 @@ class GatedDeltaNetBlock(FFNBlock):
 
     # recurrent: scan over the (padded) tokens, updating the recurrent state. collect the per-step outputs
     state = Tensor(self.recurrent_state.uop.after(conv_state_store))  # carry the conv write into this graph
-    if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and amd_custom_kernels_supported(x.device):
+    # LOCAL PATCH #21 (2026-09-02): LLM_NV_SCAN=1 runs the same fused scan kernel on NV (kernels/amd.py builds it for
+    # either target); the unrolled Python scan below cost 1.46 ms per layer per 32-token chunk on the 4080 (22% of prefill)
+    if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and (amd_custom_kernels_supported(x.device) or
+        (getenv("LLM_NV_SCAN", 0) and nv_custom_kernels_supported(x.device))):
       # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3)
       core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos)).transpose(1, 2)
     else:
@@ -476,7 +487,11 @@ class Transformer:
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
   def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
-    if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
+    # LOCAL PATCH (2026-09-02): LLM_CHUNK=<n> lets non-RDNA3 recurrent models prefill in chunks through the unrolled scan
+    # (upstream #17512 notes the old scan is faster chunked than token-by-token; it kept chunk_size=1 there for CI time).
+    # default 1 = upstream behaviour. decode is unaffected: sampled tokens re-enter with a static (1,1) shape -> rollout_jit
+    if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device):
+      chunk_size = max(1, getenv("LLM_CHUNK", 1))  # 2026-09-02 pm: no longer capped by the default 32 (LLM_CHUNK=64 was silently 32)
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported

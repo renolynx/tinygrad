@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import cast, Callable, Type, TypeVar, Generic, Any
-import contextlib, decimal, statistics, time, ctypes, array, os, collections, itertools
+import contextlib, decimal, statistics, time, ctypes, array, os, collections, itertools, functools
 try: import fcntl # windows misses that
 except ImportError: fcntl = None #type:ignore[assignment]
 from tinygrad.helpers import DEV, PROFILE, getenv, from_mv, cpu_profile, ProfileRangeEvent, unwrap
@@ -247,11 +247,17 @@ class HCQSignal(Generic[HCQDeviceType]):
   @property
   def timestamp_addr(self) -> sint: return self.base_buf.va_addr + 8
 
+  @functools.cached_property
+  def _value_view(self):
+    # built once per signal: wait() spins on `value`, and rebuilding the
+    # MMIOInterface + memoryview per poll dominated TinyJit replay wall time
+    return self.base_buf.cpu_view().view(0, 8, 'Q')
+
   @property
-  def value(self) -> int: return self.base_buf.cpu_view().view(0, 8, 'Q')[0]
+  def value(self) -> int: return self._value_view[0]
 
   @value.setter
-  def value(self, new_value:int): self.base_buf.cpu_view().view(0, 8, 'Q')[0] = new_value
+  def value(self, new_value:int): self._value_view[0] = new_value
 
   @property
   def timestamp(self) -> decimal.Decimal:
