@@ -280,24 +280,29 @@ def _q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor,
 # the group scales, the per-16 sums AND the normalized fp16 activations (for the linears that stay on the generic path);
 # the norm's reduce+elementwise kernels (4 launches per layer, ~10 us each on the 4080) disappear from the decode graph.
 def _q8_norm_quantize_kernel(q:UOp, scale:UOp, xsum:UOp, xn:UOp, x:UOp, w:UOp, *rest:UOp, tokens:int, in_features:int, eps:float,
-                             norm_dim:int, gate:bool, target:str="NV") -> UOp:
+                             norm_dim:int, gate:bool, residual:bool=False, target:str="NV") -> UOp:
   groups = in_features//Q8_GROUP_SIZE
   token_group, lane = UOp.range(tokens*groups, 0, axis_type=AxisType.GLOBAL), UOp.range(32, 1, axis_type=AxisType.LOCAL)
   token, group = token_group//groups, token_group%groups
+  # residual (patch #42): x is `residual + add` (two inputs); the sum is also written out as h for the block's stream
+  add2 = rest[-2].reshape(tokens, in_features) if residual else None
+  hout = rest[-1].reshape(tokens, in_features) if residual else None
   x2 = x.reshape(tokens, in_features)
+  def xload(tok:UOp, idx:UOp) -> UOp:
+    v = x2[tok, idx].load().float()
+    return v + add2[tok, idx].load().float() if residual else v
   # every warp recomputes its token's rms over its norm span (the whole row, or the head of norm_dim channels this group
   # belongs to): norm_dim/32 coalesced loads per lane of an L2-resident row is far cheaper than a second kernel
   per = norm_dim // 32
   span0 = (group * 32 // norm_dim) * norm_dim
   ssq = UOp.const(0, dtypes.float32)
   for i in range(per):
-    v = x2[token, span0 + lane + 32*i].load().float()
+    v = xload(token, span0 + lane + 32*i)
     ssq = ssq + v*v
   rms = (warp_reduce(ssq, full_wave=True) * (1.0 / norm_dim) + eps).rsqrt()
-  xr = x.reshape(tokens, groups, 32)
   g2 = rest[0].reshape(tokens, groups, 32) if gate else None
   def val(idx:UOp) -> UOp:
-    v = xr[token, group, idx].load().float() * rms * w[(group*32 + idx) % norm_dim].load().float()
+    v = xload(token, group*32 + idx) * rms * w[(group*32 + idx) % norm_dim].load().float()
     if gate:
       gv = g2[token, group, idx].load().float()
       v = v * (gv / (1 + (gv * -1.4426950408889634).exp2()))   # silu(gate)
@@ -314,6 +319,7 @@ def _q8_norm_quantize_kernel(q:UOp, scale:UOp, xsum:UOp, xn:UOp, x:UOp, w:UOp, *
   xn2 = xn.reshape(tokens, groups, 32)
   stores = (q[token, group, lane.valid(lane < 8)].store(word),
             xn2[token, group, lane].store(mine.cast(xn.dtype)),
+            *((hout[token, group*32 + lane].store(xload(token, group*32 + lane).cast(hout.dtype)),) if residual else ()),
             UOp.group(scale[token, group.valid(lane.eq(0))].store(group_scale),
                       xsum[token, group, store_half.valid(lane.eq(0) | lane.eq(4))].store(
                         store_half.eq(0).where(gsum[0].float(), gsum[1].float()))))
@@ -403,7 +409,7 @@ def deltanet_pre(qkv:Tensor, conv_state:Tensor, conv_w:Tensor, beta_lin:Tensor, 
   return (q.reshape(1, qk_heads, 1, key_dim), k.reshape(1, qk_heads, 1, key_dim), v.reshape(1, heads, 1, value_dim),
           beta.reshape(1, heads, 1), alpha.reshape(1, heads, 1, 1), kq.reshape(1, qk_heads, 1), cs)
 
-def q8_norm_quantize(x:Tensor, weight:Tensor, eps:float, norm_dim:int|None=None, gate:Tensor|None=None) -> Tensor:
+def q8_norm_quantize(x:Tensor, weight:Tensor, eps:float, norm_dim:int|None=None, gate:Tensor|None=None, add:Tensor|None=None):
   """RMSNorm(x) * weight (* silu(gate)) as fp16, with its q8 quantization pre-computed and cached for the linears that consume
   it. norm_dim < in_features normalizes per head of norm_dim channels (Gated DeltaNet's ssm_norm), weight then has norm_dim entries."""
   tokens, in_features = int(x.numel()) // int(x.shape[-1]), int(x.shape[-1])
@@ -415,12 +421,17 @@ def q8_norm_quantize(x:Tensor, weight:Tensor, eps:float, norm_dim:int|None=None,
   xsum = Tensor.empty(tokens, groups, 2, dtype=dtypes.float32, device=x.device)
   xn = Tensor.empty(tokens, in_features, dtype=dtypes.float16, device=x.device)
   extra = () if gate is None else (gate.reshape(tokens, in_features).contiguous(),)
-  q, scale, xsum, xn = Tensor.custom_kernel(q, scale, xsum, xn, x.reshape(tokens, in_features).contiguous(), weight.contiguous(), *extra,
+  if add is not None:   # patch #42: the residual add rides along; the sum comes back as h
+    hbuf = Tensor.empty(tokens, in_features, dtype=x.dtype, device=x.device)
+    extra = extra + (add.reshape(tokens, in_features).contiguous(), hbuf)
+  outs = Tensor.custom_kernel(q, scale, xsum, xn, x.reshape(tokens, in_features).contiguous(), weight.contiguous(), *extra,
     fxn=functools.partial(_q8_norm_quantize_kernel, tokens=tokens, in_features=in_features, eps=float(eps), norm_dim=norm_dim,
-                          gate=gate is not None, target=_TARGET))[:4]
+                          gate=gate is not None, residual=add is not None, target=_TARGET))
+  q, scale, xsum, xn = outs[:4]
   xn = xn.reshape(*x.shape[:-1], in_features)
   if len(_Q8_CACHE) >= 8: _Q8_CACHE.pop(next(iter(_Q8_CACHE)))
   _Q8_CACHE[(xn.uop, tokens, in_features, _TARGET)] = (q, scale, xsum)
+  if add is not None: return xn, outs[-1].reshape(*x.shape[:-1], in_features)
   return xn
 
 def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str) -> UOp:
@@ -429,9 +440,19 @@ def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:s
   token_output = UOp.range(out.shape[0]*out_features, 0, axis_type=AxisType.GLOBAL)
   chunk, lane = UOp.range(chunks, 1, axis_type=AxisType.GLOBAL), UOp.range(32, 2, axis_type=AxisType.LOCAL)
   token, output = token_output // out_features, token_output % out_features
-  group = (lane+chunk*32).minimum(group_count-1)
-  value = group_dot(token, output, group) if chunks*32 == group_count else \
-    (lane+chunk*32 < group_count).where(group_dot(token, output, group), UOp.const(0, dtypes.float32))
+  if chunks == 1 and group_count > 32:
+    # LOCAL PATCH #41 (2026-09-06): no split-K for the K <= 8192 linears - one warp walks every group of its output row,
+    # so the (tokens, out, chunks) partial buffer and its summing kernel (~5 launches per layer on the 27B) disappear
+    per = (group_count + 31) // 32
+    value = UOp.const(0, dtypes.float32)
+    for c in range(per):
+      g = lane + 32*c
+      part = group_dot(token, output, g.minimum(group_count-1))
+      value = value + (part if 32*(c+1) <= group_count else (g < group_count).where(part, UOp.const(0, dtypes.float32)))
+  else:
+    group = (lane+chunk*32).minimum(group_count-1)
+    value = group_dot(token, output, group) if chunks*32 == group_count else \
+      (lane+chunk*32 < group_count).where(group_dot(token, output, group), UOp.const(0, dtypes.float32))
   total = warp_reduce(value, full_wave=True)
   return out[token, output, chunk.valid(lane.eq(0))].store(total.cast(out.dtype)).end(token_output, chunk, lane).sink(
     arg=KernelInfo(name=name, opts_to_apply=()))
@@ -711,7 +732,7 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
     params = tuple(UOp.placeholder_like(src, slot=i) for i,src in enumerate(all_srcs))
     kernel = fxn(*params, out_features=out_features, in_features=in_features).call(*all_srcs)
     result = Tensor(out.after(kernel))
-    if len(result.shape) == 3: result = result.sum(-1)
+    if len(result.shape) == 3: result = result.reshape(result.shape[0], out_features) if result.shape[2] == 1 else result.sum(-1)
     result = result.reshape(*x.shape[:-1], out_features)
     return result if layer.bias is None else result + layer.bias
   out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device).uop
@@ -720,7 +741,8 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
     extra = (iq4_half_lut(str(x.device)).uop,) if layer.ggml_type == IQ4_XS else ()
     return run(fxn, out, raw, x.cast(dtypes.float16).contiguous().uop, *extra)
   xq_, xd, xs = q8_quantize(x, tokens, in_features)
-  out = Tensor.empty(tokens, out_features, (in_features+1023)//1024, dtype=dtypes.float32, device=x.device).uop
+  chunks = 1 if _TARGET == "NV" and in_features <= getenv("LLM_Q8_SPLITK_MIN", 8192) else (in_features+1023)//1024   # patch #41
+  out = Tensor.empty(tokens, out_features, chunks, dtype=dtypes.float32, device=x.device).uop
   if layer.ggml_type == IQ3_S:
     # no xs input: IQ3_S has no min offset, and an UNUSED kernel parameter breaks the JIT replay's argument mapping
     # (the eager call is fine, the replayed one reads the wrong buffer - found 2026-09-02 with nv_iq3s_jit_probe.py)

@@ -206,3 +206,13 @@ The flash kernel can write its output in the buffer's own dtype (half/bf16) and 
 ## Patch 40 (2026-09-06, NV, `LLM_NV_DNET=1`): fused Gated DeltaNet decode step
 
 `deltanet_pre` (`kernels/amd.py`): one kernel for the conv window/4-tap conv/silu, q/k L2 norm (+ q scale), beta sigmoid, alpha softplus/exp, q.k and the in-place conv-state shift; the scan kernel accepts q/k/kq with only the key heads (head h uses h % qk_heads) and an optional precomputed kq; `q8_norm_quantize(norm_dim=head_v_dim, gate=...)` fuses ssm_norm * silu(gate) into the quantizer for ssm_out. `GatedDeltaNetBlock._attention` takes the path for B=1, T=1 on NV. Verified: 32/32 greedy tokens identical to the stock path (`llm_dequant_check.py run` with LLM_NV_DNET=0/1). Result: **no gain either** (37.0 vs 36.5 ms/token): the layer still has 29 launches because the fused kernels' inputs (the generic Q8_0 beta/alpha linears, the gate's split-K sum, casts) cost as many prep kernels as were removed. OFF by default. The real remaining lever is feeding these kernels the q8 linears' raw partial-sum buffers (no split-K sum / cast kernels in between); the profile listing in `diagnostics/logs/llm_profile_decode_dnet_summary.txt` shows the per-layer kernel sequence.
+
+## Patch 41 (2026-09-06, NV): no split-K for the K <= 8192 q8 decode linears
+
+`_decode_linear` lets one warp walk every 32-group of its output row when the partial-buffer has one chunk; `q8_linear` picks `chunks = 1` for `in_features <= LLM_Q8_SPLITK_MIN` (default 8192, so only ffn_down keeps split-K). The (tokens, out, chunks) partial buffer and its summing kernel disappear for ~300 launches per 27B decode step: 36.5 -> 35.5 ms/token (28.1 tok/s), kernel tests exact, 32/32 greedy tokens identical. Verify: `grep -c LLM_Q8_SPLITK_MIN tinygrad/llm/kernels/amd.py` >= 1.
+
+## Patch 42 (2026-09-06, NV, part of `LLM_NV_NORMQ8=1`): residual add inside the norm quantizer
+
+`q8_norm_quantize(..., add=attn)` reads `x + add` and writes the sum back as `h`, so the block's first residual add is not a kernel. Together with #39 still no measurable gain (35.96 vs 35.5 ms/token), off by default.
+
+**Where the 27B decode stands (2026-09-06 04:30):** 35.5 ms/token = ~22 ms of weight streaming at ~575 GB/s average (peak 736) + ~13 ms of everything else (~1000 small launches, the DeltaNet scan, the 16 attention layers' flash kernels, copies). Removing small launches pays ~3 us each, not the 8-10 us the profiler shows per kernel, so the fusion patches (#39/#40/#42) stopped paying. Realistic remaining levers: tune `linear_iq3_s` (535 GB/s) and `linear_iq2_s` (410 GB/s) toward 620 (~1 ms), a smaller file (IQ3_S 12 GB is ~8% fewer bytes), or speculative decoding with a draft model (a different project).

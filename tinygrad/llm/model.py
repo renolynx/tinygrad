@@ -151,8 +151,9 @@ class FFNBlock:
       if getenv("LLM_NV_NORMQ8", 0) and getenv("LLM_NV_Q8", 0) and resolve(x.shape[1] == 1, False) and nv_custom_kernels_supported(x.device) \
           and self.attn_norm.weight is not None and self.ffn_norm.weight is not None:
         from tinygrad.llm.kernels.amd import q8_norm_quantize
-        h = x + self._attention(q8_norm_quantize(x, self.attn_norm.weight, self.attn_norm.eps), start_pos)
-        return (h + self._feed_forward(q8_norm_quantize(h, self.ffn_norm.weight, self.ffn_norm.eps))).contiguous()
+        attn = self._attention(q8_norm_quantize(x, self.attn_norm.weight, self.attn_norm.eps), start_pos)
+        hn, h = q8_norm_quantize(x, self.ffn_norm.weight, self.ffn_norm.eps, add=attn)   # patch #42: h = x + attn inside the kernel
+        return (h + self._feed_forward(hn)).contiguous()
       h =     x + self._attention(self.attn_norm(x), start_pos)
       return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
     return _run(x, start_pos)
