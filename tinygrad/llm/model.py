@@ -147,6 +147,12 @@ class FFNBlock:
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp):
+      # LOCAL PATCH #39 (2026-09-06): single-token calls on NV fuse each RMSNorm into the q8 activation quantizer
+      if getenv("LLM_NV_NORMQ8", 0) and getenv("LLM_NV_Q8", 0) and resolve(x.shape[1] == 1, False) and nv_custom_kernels_supported(x.device) \
+          and self.attn_norm.weight is not None and self.ffn_norm.weight is not None:
+        from tinygrad.llm.kernels.amd import q8_norm_quantize
+        h = x + self._attention(q8_norm_quantize(x, self.attn_norm.weight, self.attn_norm.eps), start_pos)
+        return (h + self._feed_forward(q8_norm_quantize(h, self.ffn_norm.weight, self.ffn_norm.eps))).contiguous()
       h =     x + self._attention(self.attn_norm(x), start_pos)
       return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
     return _run(x, start_pos)
@@ -293,6 +299,21 @@ class GatedDeltaNetBlock(FFNBlock):
     is_kda = hasattr(self, "ssm_g_a")
     symbolic = isinstance(T, UOp)
     T_pad = x.max_shape[1]  # symbolic chunks are padded to their max size: one graph serves every size
+
+    # LOCAL PATCH #40 (2026-09-06): NV single-token decode with the fused pre-scan kernel + the fused post norm/gate quantizer
+    if getenv("LLM_NV_DNET", 0) and not is_kda and not symbolic and T == 1 and B == 1 and getenv("LLM_NV_SCAN", 0) and getenv("LLM_NV_Q8", 0) \
+        and nv_custom_kernels_supported(x.device) and self.head_k_dim == 128 and self.head_v_dim == 128 and self.ssm_conv_kernel == 4:
+      from tinygrad.llm.kernels.amd import deltanet_pre, q8_norm_quantize
+      x = x.half()
+      out_gate = self.attn_gate(x)
+      q, k, v, beta, alpha, kq, cs_after = deltanet_pre(self.attn_qkv(x), self.conv_state, self.ssm_conv1d["weight"], self.ssm_beta(x), self.ssm_alpha(x),
+                                                       self.ssm_dt["bias"], self.ssm_a, Tensor(start_pos), self.num_k_heads, self.num_v_heads,
+                                                       self.head_k_dim, self.head_v_dim, 1e-6)
+      state = Tensor(self.recurrent_state.uop.after(cs_after.uop))
+      core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos), kq=kq)   # (1, H, 1, V)
+      z = q8_norm_quantize(core.reshape(1, 1, self.num_v_heads * self.head_v_dim), self.ssm_norm.weight, self.ssm_norm.eps,
+                           norm_dim=self.head_v_dim, gate=out_gate)
+      return self.ssm_out(z)
 
     # input processing
     x = x.half()

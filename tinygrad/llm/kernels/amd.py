@@ -16,6 +16,11 @@ LDS_PAD, WMMA_ARG, LOG2E = 4, ((WMMA_M, WMMA_N, WMMA_K), 'AMD', 32), math.log2(m
 Q4_K, Q5_K, Q6_K, IQ4_XS, GGML_BLOCK_SIZE, Q8_GROUP_SIZE, Q4_WORDS, Q5_WORDS, Q6_BYTES, IQ4_WORDS = 12, 13, 14, 23, 256, 32, 36, 44, 210, 34
 Q6_PADDED, Q6_WORDS = 212, 53  # the 210-byte Q6 blocks are padded to 212 bytes so they are word-addressable
 IQ3_S, IQ3_HALFWORDS = 21, 55  # LOCAL PATCH #22 (NV only): 110-byte blocks, read through a uint16 view (2-byte aligned)
+# LOCAL PATCH #38 (2026-09-06, NV only, LLM_NV_IQX=1): Q3_K (110 B), IQ3_XXS (98 B), IQ2_S (82 B) blocks through the same
+# uint16-view decode scheme as IQ3_S (17% of the 27B Q3_K_XL's bytes were on the generic fused kernels at ~290 GB/s)
+Q3_K, IQ3_XXS, IQ2_S = 11, 18, 22
+IQX_HALFWORDS = {Q3_K: 55, IQ3_XXS: 49, IQ2_S: 41}
+IQX_TYPES = (Q3_K, IQ3_XXS, IQ2_S)
 QUANT_SIZES = {Q4_K: Q4_WORDS*4, Q5_K: Q5_WORDS*4, Q6_K: Q6_BYTES, IQ4_XS: IQ4_WORDS*4}  # bytes per 256-weight block
 
 # LOCAL PATCH #20 (2026-09-02, LLM_NV_Q8=1): the q8-activation DECODE kernels below also build for NV. The three
@@ -63,19 +68,25 @@ class Linear(nn.Linear):
     self.in_features, self.out_features = in_features, out_features
   def set_quantized(self, decoded:Tensor):
     sizes = QUANT_SIZES | ({IQ3_S: IQ3_HALFWORDS*2} if _TARGET == "NV" and getenv("LLM_NV_IQ3S", 0) else {})
+    iqx = _TARGET == "NV" and bool(getenv("LLM_NV_IQX", 0))
+    if iqx: sizes = sizes | {IQ3_XXS: IQX_HALFWORDS[IQ3_XXS]*2, IQ2_S: IQX_HALFWORDS[IQ2_S]*2}
     packed_sizes = {decoded.numel() // 256 * type_size:typ for typ,type_size in sizes.items()}
+    if iqx: packed_sizes[decoded.numel() // 256 * 110] = IQ3_S   # Q3_K and IQ3_S share the 110-byte rate: told apart below
     graph = decoded.uop.toposort()
     raw = next((u for u in graph if u.op is Ops.SHRINK and u.dtype == dtypes.uint8 and prod(u.shape) in packed_sizes), None)
     if raw is None: return
     ggml_type = packed_sizes[prod(raw.shape)]
-    if ggml_type == IQ3_S and not any(u.op is Ops.BUFFER and u.dtype == dtypes.float32 and prod(u.shape) == 2048 for u in graph): return  # Q3_K, same rate
+    if ggml_type == IQ3_S and not any(u.op is Ops.BUFFER and u.dtype == dtypes.float32 and prod(u.shape) == 2048 for u in graph):
+      if not iqx: return  # Q3_K, same rate
+      ggml_type = Q3_K
+      sizes = sizes | {Q3_K: 110}
     # the packed byte rate alone can't distinguish same-rate formats (Q4_0 vs Q4_K, Q5_0 vs Q5_K, MXFP4 vs IQ4_XS).
     # the supported formats are 256-wide superblocks: their decode views the packed bytes at the superblock width
     # (ggml_data_to_tensor reshapes to (-1, QUANT_SIZES[type])), while same-rate 32-wide formats reshape to 17-22
     if not any(u.op is Ops.RESHAPE and u.shape[-1:] == (sizes[ggml_type],) for u in graph): return
     raw_offset = raw.contiguous_view_offset()
     assert raw_offset is not None and raw_offset % 4 == 0 and raw.buf_uop.dtype == dtypes.uint8
-    if _TARGET == "NV" and raw_offset % 16 and ggml_type not in (Q6_K, IQ3_S): return  # NV vector loads need 16-byte alignment (GGUF data is 32-aligned)
+    if _TARGET == "NV" and raw_offset % 16 and ggml_type not in (Q6_K, IQ3_S, *IQX_TYPES): return  # NV vector loads need 16-byte alignment (GGUF data is 32-aligned)
     self.ggml_type = ggml_type
     # store a typed buffer view: a lazy BITCAST is decomposed into byte-combining ALU before custom-kernel
     # scheduling and would copy the entire packed weight on every JIT graph
@@ -94,6 +105,10 @@ class Linear(nn.Linear):
     elif ggml_type == IQ3_S:  # 110-byte blocks are only 2-byte aligned: a uint16 view, no repack (3.3 GB of the 27B is IQ3_S)
       packed = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer).view(raw.max_numel() * raw.dtype.itemsize // 2, dtypes.uint16, raw_offset)))
       with Context(ALLOW_DEVICE_USAGE=1): self.iq3s_grid = iq3s_grid(str(decoded.device)).realize()
+    elif ggml_type in IQX_TYPES:  # patch #38: 2-byte aligned blocks, uint16 view; IQ3_XXS/IQ2_S carry their grid as uint32 words
+      packed = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer).view(raw.max_numel() * raw.dtype.itemsize // 2, dtypes.uint16, raw_offset)))
+      if ggml_type != Q3_K:
+        with Context(ALLOW_DEVICE_USAGE=1): self.iqx_grid = iqx_grid(str(decoded.device), ggml_type).realize()
     else:
       packed = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer)
         .view(raw.max_numel() * raw.dtype.itemsize // dtypes.uint32.itemsize, dtypes.uint32, raw_offset)))
@@ -118,7 +133,7 @@ class Linear(nn.Linear):
             out = f16_gemv(self, x if isinstance(numel, int) else x.pad_to(max_shape))
             return out if isinstance(numel, int) else out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
         self.use_custom_quant = supported = False  # not a supported quant format
-    if (self.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS) or (self.ggml_type == IQ3_S and _TARGET == "NV")) and supported \
+    if (self.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS) or (self.ggml_type in (IQ3_S, *IQX_TYPES) and _TARGET == "NV")) and supported \
         and (amd or (x.ndim >= 2 and resolve(x.shape[-2] == 1, False))):
       if isinstance(x.numel(), int): return q8_linear(self, x)
       # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
@@ -242,13 +257,171 @@ def _q8_quantize_kernel(q:UOp, scale:UOp, xsum:UOp, x:UOp, tokens:int, in_featur
                         store_half.eq(0).where(gsum[0].float(), gsum[1].float()))))
   return UOp.group(*stores).end(token_group, lane).sink(arg=KernelInfo(name="q8_quantize", opts_to_apply=()))
 
+_Q8_CACHE: dict = {}   # LOCAL PATCH #37 (2026-09-06): the same activation feeds several linears (qkv+gate, gate+up, q/k/v);
+                       # quantize it once per graph build instead of once per linear (330 -> ~190 launches per 27B decode step)
 def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor, Tensor]:
+  key = (x.uop, tokens, in_features, _TARGET)
+  if getenv("LLM_Q8_DEDUPE", 1) and key in _Q8_CACHE: return _Q8_CACHE[key]
+  res = _q8_quantize(x, tokens, in_features)
+  if getenv("LLM_Q8_DEDUPE", 1):
+    if len(_Q8_CACHE) >= 8: _Q8_CACHE.pop(next(iter(_Q8_CACHE)))
+    _Q8_CACHE[key] = res
+  return res
+
+def _q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor, Tensor]:
   groups = in_features//Q8_GROUP_SIZE
   q = Tensor.empty(tokens, groups, 8, dtype=dtypes.uint32, device=x.device)
   scale = Tensor.empty(tokens, groups, dtype=dtypes.float32, device=x.device)
   xsum = Tensor.empty(tokens, groups, 2, dtype=dtypes.float32, device=x.device)
   q, scale, xsum = Tensor.custom_kernel(q, scale, xsum, x, fxn=functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features, target=_TARGET))[:3]
   return q, scale, xsum
+
+# LOCAL PATCH #39 (2026-09-06, NV): RMSNorm fused into the q8 activation quantizer. One kernel produces the int8 groups,
+# the group scales, the per-16 sums AND the normalized fp16 activations (for the linears that stay on the generic path);
+# the norm's reduce+elementwise kernels (4 launches per layer, ~10 us each on the 4080) disappear from the decode graph.
+def _q8_norm_quantize_kernel(q:UOp, scale:UOp, xsum:UOp, xn:UOp, x:UOp, w:UOp, *rest:UOp, tokens:int, in_features:int, eps:float,
+                             norm_dim:int, gate:bool, target:str="NV") -> UOp:
+  groups = in_features//Q8_GROUP_SIZE
+  token_group, lane = UOp.range(tokens*groups, 0, axis_type=AxisType.GLOBAL), UOp.range(32, 1, axis_type=AxisType.LOCAL)
+  token, group = token_group//groups, token_group%groups
+  x2 = x.reshape(tokens, in_features)
+  # every warp recomputes its token's rms over its norm span (the whole row, or the head of norm_dim channels this group
+  # belongs to): norm_dim/32 coalesced loads per lane of an L2-resident row is far cheaper than a second kernel
+  per = norm_dim // 32
+  span0 = (group * 32 // norm_dim) * norm_dim
+  ssq = UOp.const(0, dtypes.float32)
+  for i in range(per):
+    v = x2[token, span0 + lane + 32*i].load().float()
+    ssq = ssq + v*v
+  rms = (warp_reduce(ssq, full_wave=True) * (1.0 / norm_dim) + eps).rsqrt()
+  xr = x.reshape(tokens, groups, 32)
+  g2 = rest[0].reshape(tokens, groups, 32) if gate else None
+  def val(idx:UOp) -> UOp:
+    v = xr[token, group, idx].load().float() * rms * w[(group*32 + idx) % norm_dim].load().float()
+    if gate:
+      gv = g2[token, group, idx].load().float()
+      v = v * (gv / (1 + (gv * -1.4426950408889634).exp2()))   # silu(gate)
+    return v
+  mine = val(lane)
+  group_scale = (warp_reduce(mine.abs(), maximum=True, full_wave=True) / 127).maximum(1e-8)
+  word_lane = lane.minimum(7)
+  xs = tuple(val(word_lane*4+i) for i in range(4))
+  qs = tuple((v/group_scale).round().clip(-127, 127).cast(dtypes.int8) for v in xs)
+  word = sum((v.cast(dtypes.uint8).cast(dtypes.uint32) << (i*8) for i, v in enumerate(qs)), UOp.const(0, dtypes.uint32))
+  part = (lane < 8).where(sum((v.cast(dtypes.int32) for v in qs), UOp.const(0, dtypes.int32)), UOp.const(0, dtypes.int32))
+  gsum = [warp_reduce(((lane & 4).eq(h*4)).where(part, UOp.const(0, dtypes.int32)), full_wave=True) for h in range(2)]
+  store_half = (lane & 4) >> 2
+  xn2 = xn.reshape(tokens, groups, 32)
+  stores = (q[token, group, lane.valid(lane < 8)].store(word),
+            xn2[token, group, lane].store(mine.cast(xn.dtype)),
+            UOp.group(scale[token, group.valid(lane.eq(0))].store(group_scale),
+                      xsum[token, group, store_half.valid(lane.eq(0) | lane.eq(4))].store(
+                        store_half.eq(0).where(gsum[0].float(), gsum[1].float()))))
+  return UOp.group(*stores).end(token_group, lane).sink(arg=KernelInfo(name="q8_norm_quantize", opts_to_apply=()))
+
+# LOCAL PATCH #40 (2026-09-06, NV, LLM_NV_DNET=1): the decode-step pre-scan of a Gated DeltaNet block in one kernel.
+# Replaces ~12 launches per layer: conv window assembly, the 4-tap conv + silu, the q/k L2 normalization (+ the .repeat
+# over value heads), the q scale, beta's sigmoid, alpha's softplus/exp, q.k, and the conv-state shift.
+def _deltanet_pre_kernel(q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, kq:UOp, conv_state:UOp, x:UOp, w:UOp, beta_lin:UOp, alpha_lin:UOp,
+                         dt_bias:UOp, a:UOp, start_pos:UOp, qk_eps:float, target:str="NV") -> UOp:
+  qk_heads, key_dim = q.shape          # (16, 128)
+  heads, value_dim = v.shape           # (48, 128)
+  taps, channels = w.shape[1], w.shape[0]
+  q_dim = qk_heads * key_dim
+  assert key_dim == 128 and value_dim == 128 and taps == 4 and channels == 2 * q_dim + heads * value_dim and conv_state.shape == (taps - 1, channels)
+  head, lane = UOp.range(heads, 0, axis_type=AxisType.GLOBAL), UOp.range(32, 1, axis_type=AxisType.LOCAL)
+  initial = start_pos.eq(0)
+  def conv(c:UOp):   # silu(sum_i window[i, c] * w[c, i]) with window = [conv_state rows (reset at position 0) | x]
+    cs = tuple(initial.where(UOp.const(0, dtypes.float32), conv_state[i, c].load().float()) for i in range(taps - 1))
+    acc = x[c].load().float() * w[c, taps - 1].load().float()
+    for i in range(taps - 1): acc = acc + cs[i] * w[c, i].load().float()
+    return acc / (1 + (acc * -1.4426950408889634).exp2()), cs   # silu
+  is_qk = head < qk_heads
+  # --- q, k for key head `head` (only the first qk_heads warps; the value-head warps skip via valid masks)
+  qh, kh = head.minimum(qk_heads - 1), head.minimum(qk_heads - 1)
+  qvals, kvals, qcs, kcs = [], [], [], []
+  for j in range(4):
+    cq, ck = qh * key_dim + lane * 4 + j, q_dim + kh * key_dim + lane * 4 + j
+    vq, csq = conv(cq); vk, csk = conv(ck)
+    qvals.append(vq); kvals.append(vk); qcs.append((cq, csq)); kcs.append((ck, csk))
+  qss = warp_reduce(sum((t*t for t in qvals), UOp.const(0, dtypes.float32)), full_wave=True)
+  kss = warp_reduce(sum((t*t for t in kvals), UOp.const(0, dtypes.float32)), full_wave=True)
+  qn = tuple(t / qss.sqrt().maximum(qk_eps) * (key_dim ** -0.5) for t in qvals)
+  kn = tuple(t / kss.sqrt().maximum(qk_eps) for t in kvals)
+  kq_val = warp_reduce(sum((a_*b_ for a_, b_ in zip(qn, kn)), UOp.const(0, dtypes.float32)), full_wave=True)
+  # --- v for value head `head`
+  vvals, vcs = [], []
+  for j in range(4):
+    cv = 2 * q_dim + head * value_dim + lane * 4 + j
+    vv, csv = conv(cv); vvals.append(vv); vcs.append((cv, csv))
+  # --- per-head gates
+  bl = beta_lin[head].load().float()
+  beta_val = 1 / (1 + (bl * -1.4426950408889634).exp2())
+  al = alpha_lin[head].load().float() + dt_bias[head].load().float()
+  softplus = (al > 20).where(al, ((al * 1.4426950408889634).exp2() + 1).log2() * 0.6931471805599453)
+  alpha_val = ((softplus * a[head].load().float()) * 1.4426950408889634).exp2()
+  stores = []
+  for j in range(4):
+    stores.append(q[qh.valid(is_qk), lane * 4 + j].store(qn[j]))
+    stores.append(k[kh.valid(is_qk), lane * 4 + j].store(kn[j]))
+    stores.append(v[head, lane * 4 + j].store(vvals[j]))
+  stores.append(kq[qh.valid(is_qk & lane.eq(0))].store(kq_val))
+  stores.append(beta[head.valid(lane.eq(0))].store(beta_val))
+  stores.append(alpha[head.valid(lane.eq(0))].store(alpha_val))
+  # conv-state shift: rows 0..taps-3 <- rows 1..taps-2 (after the reset), last row <- x. Each channel is written by exactly
+  # one warp: q/k channels by their key-head warp, v channels by their value-head warp.
+  for (c, cs) in qcs + kcs:
+    for i in range(taps - 2): stores.append(conv_state[i, c.valid(is_qk)].store(cs[i + 1].cast(conv_state.dtype)))
+    stores.append(conv_state[taps - 2, c.valid(is_qk)].store(x[c].load().cast(conv_state.dtype)))
+  for (c, cs) in vcs:
+    for i in range(taps - 2): stores.append(conv_state[i, c].store(cs[i + 1].cast(conv_state.dtype)))
+    stores.append(conv_state[taps - 2, c].store(x[c].load().cast(conv_state.dtype)))
+  return UOp.group(*stores).end(head, lane).sink(arg=KernelInfo(name="deltanet_pre", opts_to_apply=()))
+
+def deltanet_pre(qkv:Tensor, conv_state:Tensor, conv_w:Tensor, beta_lin:Tensor, alpha_lin:Tensor, dt_bias:Tensor, a:Tensor,
+                 start_pos:Tensor, qk_heads:int, heads:int, key_dim:int, value_dim:int, qk_eps:float) -> tuple:
+  """decode step (B=1, T=1): returns q (1,qk_heads,1,K), k, v (1,heads,1,V), beta (1,heads,1), alpha (1,heads,1,1), kq (1,qk_heads,1),
+  and the conv_state tensor to order the scan after (the kernel shifts the conv state in place)"""
+  global _TARGET
+  _TARGET = "NV"
+  dev = qkv.device
+  q = Tensor.empty(qk_heads, key_dim, dtype=dtypes.float32, device=dev)
+  k = Tensor.empty(qk_heads, key_dim, dtype=dtypes.float32, device=dev)
+  v = Tensor.empty(heads, value_dim, dtype=dtypes.float32, device=dev)
+  beta = Tensor.empty(heads, dtype=dtypes.float32, device=dev)
+  alpha = Tensor.empty(heads, dtype=dtypes.float32, device=dev)
+  kq = Tensor.empty(qk_heads, dtype=dtypes.float32, device=dev)
+  channels = conv_w.shape[0]
+  srcs = (q, k, v, beta, alpha, kq, conv_state.reshape(conv_state.shape[-2], channels), qkv.reshape(channels).contiguous(), conv_w.contiguous(),
+          beta_lin.reshape(heads).contiguous(), alpha_lin.reshape(heads).contiguous(), dt_bias.reshape(heads).contiguous(), a.reshape(heads).contiguous())
+  contig = tuple(x.uop if x.uop.op is Ops.AFTER else x.uop.contiguous() for x in srcs)
+  params = tuple(UOp.placeholder_like(x, slot=i) for i,x in enumerate(contig))
+  assert start_pos.uop.is_bound_var
+  call = _deltanet_pre_kernel(*params, kernel_var(start_pos.uop.src[0]), qk_eps=qk_eps, target=_TARGET).call(*contig)
+  outs = [Tensor(c.after(call)) for c in contig[:7]]
+  q, k, v, beta, alpha, kq, cs = outs
+  return (q.reshape(1, qk_heads, 1, key_dim), k.reshape(1, qk_heads, 1, key_dim), v.reshape(1, heads, 1, value_dim),
+          beta.reshape(1, heads, 1), alpha.reshape(1, heads, 1, 1), kq.reshape(1, qk_heads, 1), cs)
+
+def q8_norm_quantize(x:Tensor, weight:Tensor, eps:float, norm_dim:int|None=None, gate:Tensor|None=None) -> Tensor:
+  """RMSNorm(x) * weight (* silu(gate)) as fp16, with its q8 quantization pre-computed and cached for the linears that consume
+  it. norm_dim < in_features normalizes per head of norm_dim channels (Gated DeltaNet's ssm_norm), weight then has norm_dim entries."""
+  tokens, in_features = int(x.numel()) // int(x.shape[-1]), int(x.shape[-1])
+  norm_dim = in_features if norm_dim is None else norm_dim
+  assert in_features % norm_dim == 0 and norm_dim % 32 == 0 and weight.numel() == norm_dim
+  groups = in_features//Q8_GROUP_SIZE
+  q = Tensor.empty(tokens, groups, 8, dtype=dtypes.uint32, device=x.device)
+  scale = Tensor.empty(tokens, groups, dtype=dtypes.float32, device=x.device)
+  xsum = Tensor.empty(tokens, groups, 2, dtype=dtypes.float32, device=x.device)
+  xn = Tensor.empty(tokens, in_features, dtype=dtypes.float16, device=x.device)
+  extra = () if gate is None else (gate.reshape(tokens, in_features).contiguous(),)
+  q, scale, xsum, xn = Tensor.custom_kernel(q, scale, xsum, xn, x.reshape(tokens, in_features).contiguous(), weight.contiguous(), *extra,
+    fxn=functools.partial(_q8_norm_quantize_kernel, tokens=tokens, in_features=in_features, eps=float(eps), norm_dim=norm_dim,
+                          gate=gate is not None, target=_TARGET))[:4]
+  xn = xn.reshape(*x.shape[:-1], in_features)
+  if len(_Q8_CACHE) >= 8: _Q8_CACHE.pop(next(iter(_Q8_CACHE)))
+  _Q8_CACHE[(xn.uop, tokens, in_features, _TARGET)] = (q, scale, xsum)
+  return xn
 
 def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str) -> UOp:
   chunks = out.shape[2]
@@ -432,8 +605,105 @@ def _iq3s_decode_kernel(out:UOp, raw16:UOp, xq:UOp, xd:UOp, grid:UOp, out_featur
     return dot.float() * xd[token, group] * d * (sc * 2 + 1).float()
   return _decode_linear(out, out_features, group_count, group_dot, "linear_iq3_s")
 
+@functools.cache
+def iqx_grid(device:str, ggml_type:int) -> Tensor:
+  from tinygrad.runtime.autogen.ggml_common import iq3xxs_grid, iq2s_grid
+  if ggml_type == IQ3_XXS: words = list(iq3xxs_grid)                                  # 256 entries x 4 magnitude bytes
+  else: words = [w for v in iq2s_grid for w in (v & 0xffffffff, v >> 32)]             # 1024 entries x 8 bytes -> lo, hi words
+  return Tensor(words, dtype=dtypes.uint32, device=device).contiguous()
+
+def _hw_word(raw16:UOp, hw:UOp) -> UOp:
+  """two consecutive halfwords as one little-endian uint32 (byte-aligned reads of a 2-byte aligned block)"""
+  return raw16[hw].load().cast(dtypes.uint32) | (raw16[hw + 1].load().cast(dtypes.uint32) << 16)
+
+def _hw_byte(raw16:UOp, hb:UOp, byte:int|UOp) -> UOp:
+  return (raw16[hb + byte // 2].load().cast(dtypes.uint32) >> ((byte % 2) * 8).cast(dtypes.uint32)) & 255
+
+def _signed_word(mag:UOp, s4:UOp) -> UOp:
+  """apply 4 sign bits (1 = negative) to the 4 magnitude bytes of a word (two's complement per byte, as IQ3_S does)"""
+  m = ((s4 * 0x204081) & 0x01010101) * 0xFF
+  return (mag ^ m) + (m & 0x01010101)
+
+@functools.cache
+def _q3k_decode_kernel(out:UOp, raw16:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:int, in_features:int, target:str="NV") -> UOp:
+  """LOCAL PATCH #38: q8-activation decode over Q3_K blocks (hmask:32, qs:64, scales:12 (16 x 6-bit), d:2 = 110 bytes).
+  weight = d * scale[j] * (q2 - (hbit ? 0 : 4)); the -4 offset is folded in through the per-16 activation sums (xs)."""
+  group_count = in_features // Q8_GROUP_SIZE
+  def group_dot(token:UOp, output:UOp, group:UOp) -> UOp:
+    block, g = group // 8, group % 8
+    hb = (output * (in_features // GGML_BLOCK_SIZE) + block) * IQX_HALFWORDS[Q3_K]
+    half, shift = g // 4, g % 4
+    xwords = _amd_load(xq[token, group, 0], 8)
+    d = _half(raw16[hb + 54].load().cast(dtypes.uint32))
+    def scale(j:int) -> UOp:   # llama.cpp layout: low nibbles of bytes 96..103, high 2 bits from bytes 104..107, minus 32
+      lo = (_hw_byte(raw16, hb, 96 + (j % 8)) >> (4 * (j // 8))) & 15
+      hi = (_hw_byte(raw16, hb, 104 + (j % 4)) >> (2 * (j // 4))) & 3
+      return (lo | (hi << 4)).cast(dtypes.int32) - 32
+    dots = []
+    for i in range(8):   # word i = weights 32g+4i .. +3 = bytes 4i..4i+3 of the half's 32 qs bytes / of hmask
+      q = (_hw_word(raw16, hb + 16 + 16 * half + 2 * i) >> (2 * shift)) & 0x03030303
+      h = (_hw_word(raw16, hb + 2 * i) >> g) & 0x01010101
+      dots.append(_amd_dp4a(q + (h << 2), xwords[i], UOp.const(0, dtypes.int32)))
+    dot_a = sum(dots[1:4], dots[0]); dot_b = sum(dots[5:8], dots[4])
+    xs_a, xs_b = xs[token, group, 0], xs[token, group, 1]
+    val = (dot_a.float() - 4.0 * xs_a) * scale(2 * g).float() + (dot_b.float() - 4.0 * xs_b) * scale(2 * g + 1).float()
+    return val * xd[token, group] * d
+  return _decode_linear(out, out_features, group_count, group_dot, "linear_q3_k")
+
+def _ksign8(k7:UOp) -> UOp:
+  """ksigns_iq2xs[k] = k | (parity(k) << 7): the 8 sign bits of 8 weights"""
+  p = k7 ^ (k7 >> 4); p = p ^ (p >> 2); p = p ^ (p >> 1)
+  return k7 | ((p & 1) << 7)
+
+@functools.cache
+def _iq3xxs_decode_kernel(out:UOp, raw16:UOp, xq:UOp, xd:UOp, grid:UOp, out_features:int, in_features:int, target:str="NV") -> UOp:
+  """LOCAL PATCH #38: q8-activation decode over IQ3_XXS blocks (d:2, qs:64 (8-bit grid indices), 8 x uint32 scale/sign words
+  = 98 bytes). A 32-group = 8 grid entries of 4 magnitudes; word g: bits 28-31 scale (db = d * (0.5 + s) * 0.5), four 7-bit
+  ksigns indices (8 sign bits each, one per pair of entries)."""
+  group_count = in_features // Q8_GROUP_SIZE
+  def group_dot(token:UOp, output:UOp, group:UOp) -> UOp:
+    block, g = group // 8, group % 8
+    hb = (output * (in_features // GGML_BLOCK_SIZE) + block) * IQX_HALFWORDS[IQ3_XXS]
+    xwords = _amd_load(xq[token, group, 0], 8)
+    d = _half(raw16[hb].load().cast(dtypes.uint32))
+    aux = _hw_word(raw16, hb + 33 + 2 * g)                       # bytes 66+4g .. 69+4g
+    qs = tuple(raw16[hb + 1 + 4 * g + i].load().cast(dtypes.uint32) for i in range(4))   # bytes 2+8g .. 9+8g
+    dot = UOp.const(0, dtypes.int32)
+    for i in range(8):
+      idx = (qs[i // 2] >> ((i % 2) * 8)) & 255
+      mag = grid[idx.cast(dtypes.weakint)].load()
+      s8 = _ksign8((aux >> (7 * (i // 2))) & 127)
+      s4 = (s8 >> (4 * (i % 2))) & 15
+      dot = _amd_dp4a(_signed_word(mag, s4), xwords[i], dot)
+    return dot.float() * xd[token, group] * d * ((aux >> 28).float() + 0.5) * 0.5
+  return _decode_linear(out, out_features, group_count, group_dot, "linear_iq3_xxs")
+
+@functools.cache
+def _iq2s_decode_kernel(out:UOp, raw16:UOp, xq:UOp, xd:UOp, grid:UOp, out_features:int, in_features:int, target:str="NV") -> UOp:
+  """LOCAL PATCH #38: q8-activation decode over IQ2_S blocks (d:2, qs:32 (8-bit grid indices), signs:32, qh:8 (2 high index
+  bits per entry), scales:8 (4-bit per 16 weights) = 82 bytes). A 32-group = 4 grid entries of 8 magnitudes (2 words each);
+  db = d * (0.5 + scale) * 0.25 per 16 weights."""
+  group_count = in_features // Q8_GROUP_SIZE
+  def group_dot(token:UOp, output:UOp, group:UOp) -> UOp:
+    block, g = group // 8, group % 8
+    hb = (output * (in_features // GGML_BLOCK_SIZE) + block) * IQX_HALFWORDS[IQ2_S]
+    xwords = _amd_load(xq[token, group, 0], 8)
+    d = _half(raw16[hb].load().cast(dtypes.uint32))
+    qh = _hw_byte(raw16, hb, 66 + g)
+    sc = _hw_byte(raw16, hb, 74 + g)
+    dots = []
+    for l in range(4):   # entry l = weights 8l..8l+7 = words 2l, 2l+1
+      idx = _hw_byte(raw16, hb, 2 + 4 * g + l) | (((qh >> (2 * l)) & 3) << 8)
+      s8 = _hw_byte(raw16, hb, 34 + 4 * g + l)
+      base = idx.cast(dtypes.weakint) * 2
+      dot = _amd_dp4a(_signed_word(grid[base].load(), s8 & 15), xwords[2 * l], UOp.const(0, dtypes.int32))
+      dots.append(_amd_dp4a(_signed_word(grid[base + 1].load(), (s8 >> 4) & 15), xwords[2 * l + 1], dot))
+    val = (dots[0] + dots[1]).float() * ((sc & 15).float() + 0.5) + (dots[2] + dots[3]).float() * ((sc >> 4).float() + 0.5)
+    return val * xd[token, group] * d * 0.25
+  return _decode_linear(out, out_features, group_count, group_dot, "linear_iq2_s")
+
 def q8_linear(layer:Linear, x:Tensor) -> Tensor:
-  assert layer.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS, IQ3_S)
+  assert layer.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS, IQ3_S, *IQX_TYPES)
   tokens = int(x.numel()) // layer.in_features
   raw, out_features, in_features = getattr(layer, "raw_weight", layer.weight).uop.buf_uop, layer.out_features, layer.in_features
   def run(fxn:Callable[..., UOp], out:UOp, *srcs:UOp) -> Tensor:
@@ -455,6 +725,9 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
     # no xs input: IQ3_S has no min offset, and an UNUSED kernel parameter breaks the JIT replay's argument mapping
     # (the eager call is fine, the replayed one reads the wrong buffer - found 2026-09-02 with nv_iq3s_jit_probe.py)
     return run(functools.partial(_iq3s_decode_kernel, target=_TARGET), out, raw, xq_.uop, xd.uop, layer.iq3s_grid.uop)
+  if layer.ggml_type == Q3_K: return run(functools.partial(_q3k_decode_kernel, target=_TARGET), out, raw, xq_.uop, xd.uop, xs.uop)
+  if layer.ggml_type == IQ3_XXS: return run(functools.partial(_iq3xxs_decode_kernel, target=_TARGET), out, raw, xq_.uop, xd.uop, layer.iqx_grid.uop)
+  if layer.ggml_type == IQ2_S: return run(functools.partial(_iq2s_decode_kernel, target=_TARGET), out, raw, xq_.uop, xd.uop, layer.iqx_grid.uop)
   decode = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type, target=_TARGET)
   return run(decode, out, raw, xq_.uop, xd.uop, xs.uop)
 
@@ -716,20 +989,25 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
   key_dim, alpha_dim = q.shape[-1], alpha.shape[-1] if len(alpha.shape) == 4 else 1
   assert all(isinstance(x, int) for x in (batch, heads, tokens, value_dim, key_dim)) and key_dim % 32 == 0 and value_dim % row_tile == 0
   batch, heads, tokens, value_dim, key_dim = cast(tuple[int, int, int, int, int], (batch, heads, tokens, value_dim, key_dim))
+  # LOCAL PATCH #40 (2026-09-06): q/k (and kq) may carry only the key heads (Qwen3.5: 16 for 48 value heads); head h uses
+  # key head h % qk_heads, which is what the model's .repeat() of the normalized q/k produces
+  qk_heads = q.shape[1]
+  assert heads % qk_heads == 0 and (qk_heads == heads or batch == 1)
   core, v = (x.reshape(batch*heads, tokens, value_dim) for x in (core, v))
-  q, k = (x.reshape(batch*heads, tokens, key_dim) for x in (q, k))
-  beta, kq = (x.reshape(batch*heads, tokens) for x in (beta, kq))
+  q, k = (x.reshape(batch*qk_heads, tokens, key_dim) for x in (q, k))
+  beta, kq = beta.reshape(batch*heads, tokens), kq.reshape(batch*qk_heads, tokens)
   alpha, state = alpha.reshape(batch*heads, tokens, alpha_dim), state.reshape(batch*heads, value_dim, key_dim)
   bh_row, lane = UOp.range(batch*heads*value_dim//row_tile, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
   bh, row_base = bh_row // (value_dim//row_tile), (bh_row % (value_dim//row_tile))*row_tile
+  bhq = bh if qk_heads == heads else bh % qk_heads
   rows, cols = tuple(row_base+i for i in range(row_tile)), tuple(lane + i*32 for i in range(key_dim//32))
   current = UOp.placeholder((row_tile*key_dim//32,), dtypes.float32, slot=0, addrspace=AddrSpace.REG)
   initial = None if start_pos is None else start_pos.eq(0)
   current = current.after(current.store(UOp.stack(*(state[bh, row, col].float() if initial is None else
     initial.where(0, state[bh, row, col].float()) for row in rows for col in cols))))
   token = UOp.range(tokens, 2, AxisType.REDUCE)
-  keys = tuple(k[bh, token, col].load() for col in cols)
-  queries = tuple(q[bh, token, col].load() for col in cols)
+  keys = tuple(k[bhq, token, col].load() for col in cols)
+  queries = tuple(q[bhq, token, col].load() for col in cols)
   updates, stores = [], []
   for row_idx,row in enumerate(rows):
     previous = tuple(current.after(token)[row_idx*key_dim//32+i].load() for i in range(key_dim//32))
@@ -738,22 +1016,23 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
     state_q = warp_reduce(sum((x*y for x,y in zip(previous, queries)), UOp.const(0, dtypes.float32)), full_wave=True)
     delta = (v[bh, token, row].load() - state_k*av) * bv
     updates += [x*av + delta*y for x,y in zip(previous, keys)]
-    stores.append(core[bh, token, row.valid(lane.eq(0))].store(state_q*av + delta*kq[bh, token]))
+    stores.append(core[bh, token, row.valid(lane.eq(0))].store(state_q*av + delta*kq[bhq, token]))
   step = UOp.group(*stores, current.store(UOp.stack(*updates))).end(token)
   state_stores = (state[bh, row, col].store(current.after(step)[row_idx*key_dim//32+i].load().cast(state.dtype))
                   for row_idx,row in enumerate(rows) for i,col in enumerate(cols))
   return UOp.group(*state_stores).end(lane, bh_row).sink(arg=KernelInfo(name="gated_delta_prefill", opts_to_apply=()))
 
-def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor, state:Tensor, start_pos:Tensor|None=None) -> Tensor:
+def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor, state:Tensor, start_pos:Tensor|None=None, kq:Tensor|None=None) -> Tensor:
   # LOCAL PATCH #21 (2026-09-02): the scan kernel is plain UOps + warp_reduce, so it also builds for NV (LLM_NV_SCAN=1)
   global _TARGET
   _TARGET = "AMD" if amd_custom_kernels_supported(q.device) else "NV"
-  batch, heads, tokens, key_dim = q.shape
-  value_dim = v.shape[-1]
+  batch, qk_heads, tokens, key_dim = q.shape
+  heads, value_dim = v.shape[1], v.shape[-1]
   assert q.shape == k.shape and v.shape[:3] == beta.shape == (batch, heads, tokens) and state.shape == (batch, heads, value_dim, key_dim)
   assert alpha.shape[:3] == (batch, heads, tokens) and (len(alpha.shape) == 3 or alpha.shape[-1] in (1, value_dim))
   assert key_dim % 32 == 0 and value_dim % 4 == 0
-  core, kq = Tensor.empty_like(v), (q*k).sum(-1).contiguous()
+  core = Tensor.empty_like(v)
+  if kq is None: kq = (q*k).sum(-1).contiguous()   # patch #40: the fused pre-scan kernel hands it over
   srcs = (core, q.contiguous(), k.contiguous(), v.contiguous(), beta.contiguous(), alpha.contiguous(), state, kq)
   if start_pos is None: return Tensor.custom_kernel(*srcs, fxn=functools.partial(_gated_delta_prefill_kernel, target=_TARGET))[0]
   contig = tuple(x.uop if x.uop.op is Ops.AFTER else x.uop.contiguous() for x in srcs)
