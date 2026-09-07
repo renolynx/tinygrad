@@ -43,11 +43,12 @@ def nv_gemm_config(M:int, N:int, K:int) -> tuple[int, int, int]|None:
 
 def _half(v:UOp) -> UOp: return v.cast(dtypes.uint16).bitcast(dtypes.float16)
 
-def _load16(buf:UOp, *idx) -> tuple[UOp, ...]:
-  """8 consecutive halves at buf[*idx] through one 16-byte load; the four component reads of the same pointer are one LDG.128"""
+def _load16(buf:UOp, *idx, dt=dtypes.float16) -> tuple[UOp, ...]:
+  """8 consecutive 2-byte elements at buf[*idx] through one 16-byte load; the four component reads of the same pointer
+  are one LDG.128. dt (patch #44) is the element type: float16 everywhere except the bfloat16 DiT GEMM."""
   ptr = buf[idx]
   words = [UOp(Ops.CUSTOM, src=(ptr,), arg=(f"(*(const uint4*)({{0}})).{c}", dtypes.uint32)) for c in "xyzw"]
-  return tuple(_half(wd >> (16 * j)) for wd in words for j in range(2))
+  return tuple((wd >> (16 * j)).cast(dtypes.uint16).bitcast(dt) for wd in words for j in range(2))
 
 @functools.cache
 def _nv_f16_gemm_kernel(out:UOp, a:UOp, w:UOp, M:int, N:int, K:int, U:int, NT:int, SPLITK:int) -> UOp:
@@ -322,3 +323,87 @@ def nv_gather(src:Tensor, idx:Tensor) -> Tensor:
   out = Tensor.empty(N, C, dtype=src.dtype, device=src.device)
   fxn = functools.partial(_nv_gather_kernel, N=N, C=C, BLOCK=BLOCK)
   return Tensor.custom_kernel(out, src.contiguous(), idx.cast(dtypes.int).contiguous(), fxn=fxn)[0]
+
+
+# ******** LOCAL PATCH #44 (2026-09-06): tiled tensor-core GEMM for the MiniMax H3 DiT linears ********
+# out[M, N] = x[M, K] @ w[N, K]^T (half or bfloat16 in, fp32 accumulate, any 2-byte dtype out), mma.sync.m16n8k16.
+# Patch #19's GEMM is one warp per block with no reuse: right for an LLM prefill chunk (M<=64, the weight is read
+# exactly once and the kernel is bandwidth-bound), useless for a DiT step where M is the whole packed sequence
+# (8640 rows at 640x352) and the shapes are square enough to be compute-bound. This one tiles:
+#   * a block owns a BM x BN output tile with NW = (BM/WM)*(BN/WN) warps, each warp a WM x WN tile = (WM/16)*(WN/8)
+#     mma accumulators in registers (32 of them at the default 32x64 -> 128 fp32 registers per thread).
+#   * no shared memory: within a block the BM/WM warps sharing a column strip issue the same weight loads and the
+#     BN/WN warps sharing a row strip the same activation loads, and L1 dedupes them (the whole 32-wide k slice of
+#     the tile is 16 KB against a 128 KB L1). Staging through shared memory is the obvious v2 and was not needed.
+#   * the same k permutation inside each 32-wide chunk as patches #19/#23 (lane t owns k = 8t..8t+7, one uint4 load
+#     per row), applied identically to A and B, so the mma fragment layout costs no shuffles.
+#   * block swizzle: G consecutive n-blocks x all m-blocks form one group, so the ~150 blocks in flight cover a
+#     compact rectangle of A and B instead of a full row of the weight. This is worth 40%: at the qkv shape G=1 is
+#     75 TFLOPS, G=4 98, G=12 103.
+# Measured 2026-09-06 on the 4080 at the H3 640x352 shapes (M=8640, bf16 in and out, per 50-block step):
+#   qkv 21504x5376 19.3 ms, out_proj 5376x7168 6.5, fc1 28672x5376 26.5, fc2 5376x14336 13.0 = 65.3 ms/block,
+#   102 TFLOPS, against 176.6 ms/block (37.7 TFLOPS) for the beam-tuned generic kernels = 8.83 -> 3.26 s per step.
+# Tile sweep at those shapes (TFLOPS, total): 128x128 warp 32x64 U1 = 102.9 (best), warp 16x128 101.3,
+# 128x256 warp 32x128 98.9, 256x128 warp 32x64 98.7, warp 64x32 82.5, warp 64x32 U2 91.9, warp 32x64 U2 91.6.
+
+def nv_tc_gemm_config(M:int, N:int, K:int) -> tuple[int, int, int, int, int, int]|None:
+  """(BM, BN, WM, WN, U, G) for out[M,N] = x[M,K] @ w[N,K]^T, or None when the shape does not tile."""
+  BM, BN, WM, WN, U = (int(os.environ.get(f"NV_GEMM_{k}", d)) for k, d in (("BM", 128), ("BN", 128), ("WM", 32), ("WN", 64), ("U", 1)))
+  if N % BN or K % (32 * U) or M < 2 * BM: return None
+  if (g := int(os.environ.get("NV_GEMM_G", "0"))) and (N // BN) % g == 0: return BM, BN, WM, WN, U, g
+  # a group of ~12-14 n-blocks was the sweep's plateau; take the divisor of N/BN closest to 12 from above, else below
+  cands = [g for g in range(1, 33) if (N // BN) % g == 0]
+  return BM, BN, WM, WN, U, min(cands, key=lambda g: (abs(g - 12), -g))
+
+@functools.cache
+def _nv_tc_gemm_kernel(out:UOp, a:UOp, w:UOp, M:int, N:int, K:int, BM:int, BN:int, WM:int, WN:int, U:int, G:int) -> UOp:
+  dt = a.dtype
+  NBM, NBN, MT, NT, NWN = (M + BM - 1) // BM, N // BN, WM // 16, WN // 8, BN // WN
+  blk = UOp.range(NBM * NBN, 0)
+  kc = UOp.range(K // (32 * U), 2, AxisType.REDUCE)
+  wave = UOp.range((BM // WM) * NWN, 3, axis_type=AxisType.LOCAL)
+  lane = UOp.range(32, -1, axis_type=AxisType.WARP)
+  rem = blk % (G * NBM)                                    # block swizzle: G n-blocks x every m-block per group
+  nb, mb = (blk // (G * NBM)) * G + rem % G, rem // G
+  g, t = lane // 4, lane % 4
+  m0, n0 = mb * BM + (wave // NWN) * WM, nb * BN + (wave % NWN) * WN
+  rows = [m0 + mt * 16 + g + h for mt in range(MT) for h in (0, 8)]
+  rows_c = [r if M % BM == 0 else r.minimum(M - 1) for r in rows]
+  accs = [UOp.placeholder((4,), dtypes.float32, slot=i, addrspace=AddrSpace.REG) for i in range(MT * NT)]
+  accs = [x.after(x.store(x.const_like(0))) for x in accs]
+  cur = [UOp.stack(*(accs[i].after(kc)[j].load() for j in range(4))) for i in range(MT * NT)]
+  for u in range(U):
+    k0 = (kc * U + u) * 32 + t * 8
+    bv = [_load16(w, n0 + nt * 8 + g, k0, dt=dt) for nt in range(NT)]
+    av = [_load16(a, r, k0, dt=dt) for r in rows_c]
+    for s in range(2):
+      b = 4 * s
+      bf = [UOp.stack(*bv[nt][b:b+4]) for nt in range(NT)]
+      for mt in range(MT):
+        a0, a1 = av[2 * mt], av[2 * mt + 1]
+        af = UOp.stack(a0[b], a0[b+1], a1[b], a1[b+1], a0[b+2], a0[b+3], a1[b+2], a1[b+3])
+        for nt in range(NT): cur[mt * NT + nt] = UOp.wmma(af, bf[nt], cur[mt * NT + nt], *WMMA_ARG)
+  update = UOp.group(*(accs[i].store(cur[i]) for i in range(MT * NT))).end(kc)
+  odt, stores = out.dtype, []
+  for mt in range(MT):
+    for nt in range(NT):
+      acc = accs[mt * NT + nt].after(update)
+      c0 = n0 + nt * 8 + 2 * t
+      for h in range(2):
+        r = rows[2 * mt + h]
+        rv = r if M % BM == 0 else r.valid(r < M)
+        stores += [out[rv, c0].store(acc[2 * h].load().cast(odt)), out[rv, c0 + 1].store(acc[2 * h + 1].load().cast(odt))]
+  name = f"nv_tcgemm_m{M}_n{N}_k{K}_b{BM}x{BN}_w{WM}x{WN}_u{U}_g{G}_{dt.name}_{odt.name}"
+  return UOp.group(*stores).end(wave, lane).end(blk).sink(arg=KernelInfo(name=name, opts_to_apply=()))
+
+def nv_tc_gemm(x:Tensor, w:Tensor, out_dtype=dtypes.float32) -> Tensor:
+  """x[M, K], w[N, K] (both half or both bfloat16, contiguous) -> [M, N] out_dtype, fp32 accumulated"""
+  M, K = x.shape
+  N = w.shape[0]
+  assert isinstance(M, int) and isinstance(K, int) and isinstance(N, int) and w.shape[1] == K
+  assert x.dtype == w.dtype and x.dtype in (dtypes.half, dtypes.bfloat16), "nv_tc_gemm needs matching half/bfloat16 inputs"
+  cfg = nv_tc_gemm_config(M, N, K)
+  assert cfg is not None, f"nv_tc_gemm: shape {(M, N, K)} does not tile"
+  out = Tensor.empty(M, N, dtype=out_dtype, device=x.device)
+  fxn = functools.partial(_nv_tc_gemm_kernel, M=M, N=N, K=K, BM=cfg[0], BN=cfg[1], WM=cfg[2], WN=cfg[3], U=cfg[4], G=cfg[5])
+  return Tensor.custom_kernel(out, x, w, fxn=fxn)[0]

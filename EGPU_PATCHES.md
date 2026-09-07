@@ -217,6 +217,49 @@ The flash kernel can write its output in the buffer's own dtype (half/bf16) and 
 
 **Where the 27B decode stands (2026-09-06 04:30):** 35.5 ms/token = ~22 ms of weight streaming at ~575 GB/s average (peak 736) + ~13 ms of everything else (~1000 small launches, the DeltaNet scan, the 16 attention layers' flash kernels, copies). Removing small launches pays ~3 us each, not the 8-10 us the profiler shows per kernel, so the fusion patches (#39/#40/#42) stopped paying. Realistic remaining levers: tune `linear_iq3_s` (535 GB/s) and `linear_iq2_s` (410 GB/s) toward 620 (~1 ms), a smaller file (IQ3_S 12 GB is ~8% fewer bytes), or speculative decoding with a draft model (a different project).
 
+## Patch 44 (2026-09-06): tiled tensor-core GEMM for the MiniMax H3 DiT linears (`nv_tc_gemm`, ComfyUI `COMFY_TINY_GEMM=1`)
+
+`tinygrad/llm/kernels/nv.py` `nv_tc_gemm(x[M,K], w[N,K]) -> [M,N]`: half or bfloat16 operands, fp32 accumulate,
+any 2-byte output dtype, mma.sync.m16n8k16. Patch #19's GEMM is one warp per block with no reuse - right for an
+LLM prefill chunk (M<=64, the weight is read exactly once, bandwidth-bound), useless for a DiT step where M is the
+whole packed sequence (8640 rows at 640x352) and the four Q3_K linears per block are the entire compute budget.
+
+Design: a block owns a BM x BN output tile with (BM/WM)*(BN/WN) warps of WM x WN each = (WM/16)*(WN/8) mma
+accumulators in registers (32 at the default 128x128 block, 32x64 warp). **No shared memory** - inside a block the
+warps sharing a column strip issue identical weight loads and those sharing a row strip identical activation loads,
+and L1 dedupes them (a 32-wide k slice of the tile is 16 KB against a 128 KB L1); staging through shared memory is
+the obvious v2 and was not needed. Same 32-wide k permutation as #19/#23 (lane t owns k = 8t..8t+7, one uint4 per
+row) applied identically to A and B, so the fragment layout costs no shuffles. Ragged M: loads clamped to M-1,
+stores predicated. **Block swizzle** (G consecutive n-blocks x every m-block per group) is worth 40%: at the qkv
+shape G=1 gives 75 TFLOPS, G=4 98, G=12 103; `nv_tc_gemm_config` picks the divisor of N/BN nearest 12.
+
+Measured on the 4080 at the H3 640x352 shapes (M=8640, bf16 in and out, `diagnostics/nv_gemm/bench.py`):
+qkv 21504x5376 19.3 ms, out_proj 5376x7168 6.5, fc1 28672x5376 26.5, fc2 5376x14336 13.0 = **65.3 ms per block,
+102 TFLOPS**, against 176.6 ms (37.7 TFLOPS) for the beam-tuned generic kernels = **8.83 -> 3.26 s per 50-block
+step**. 102 TFLOPS is ~97% of the card's 104 TFLOPS fp16-with-fp32-accumulate peak (consumer Ada does NOT halve
+the fp32-accumulate rate; the flash kernel's 73 TFLOPS had already ruled that out).
+
+Tile sweep at those shapes (total TFLOPS): 128x128 warp 32x64 U1 = **102.9**, warp 16x128 101.3, 128x256 warp
+32x128 98.9, 256x128 warp 32x64 98.7, 64x128 warp 32x64 96.9, warp 32x32 94.7, warp 64x32 U2 91.9, warp 32x64 U2
+91.6, warp 64x32 U1 82.5. Env overrides `NV_GEMM_BM/BN/WM/WN/U/G` for re-tuning.
+
+**Model result (640x352, 8640 packed rows):** a sampling step 12 -> 7 s under the production JIT replay
+(`dit_test.py`, 4 steps: eager 216 -> 205 s, capture 55 -> 48, replay 12/12 -> 7/7); a full 8-step fox clip in the
+server 435 -> 375 s. Pixel gate against the same prompt/seed with the flag off: overall mean abs 19.38/255
+(per-frame 14.68..23.70) - the same scene, motion and lighting, the scale the flash 8x80 change (#43) also had
+(16.01/255). `diagnostics/h3/gemm_check.log`, sheet `diagnostics/h3/fox_gemm_sheet.jpg`.
+Note: nv.py's contents are part of the JIT-persist key, so this patch invalidates **every** persisted capture on the
+box (Klein, Krea 2, H3): the first clip/image per model+resolution recaptures once. `COMFY_TINY_GEMM` is in the key
+too (`tiny_jit_backend._persist_version`), so flipping the flag cannot bind a stale capture.
+
+Hook: ComfyUI `comfy/tiny_ops_shim.py` `tc_linear(input, weight, bias)` (returns None -> caller falls back to
+`torch.nn.functional.linear`), called from the GGUF node's `GGMLOps.Linear.forward_ggml_cast_weights` when the
+input is on the tiny device. Gated by `COMFY_TINY_GEMM=1`; the weight arrives already dequantized as [N,K] in the
+activation dtype. Correctness: `diagnostics/nv_gemm/test_fork.py` (production N/K, half and bfloat16 in, fp32 and
+2-byte out, M = 512/500/8640/7860, all vs a tinygrad fp32 reference) ALL PASS; `diagnostics/h3/mlp_check.py` on
+the real Q3_K block-0 MLP gives relative errors identical to four decimals with the flag on and off.
+Verify: `grep -c nv_tc_gemm tinygrad/llm/kernels/nv.py` >= 3.
+
 ## Patch 43 (2026-09-06): flash kernel tile shape 8 waves x 80 keys (`NV_FLASH_WAVES`, `NV_FLASH_BN`)
 
 `_nv_flash_kernel` takes its tile shape from the env (BM = 16 * WAVES, BN a multiple of 16 with the transposed V tile `2*DV*(BN+2)` halves under 48 KB of shared memory) and names the kernel by it. The V staging loop used to drop a partial last round (`BN*DV/8` not a multiple of the thread count: wrong results at BN=80, D=64); it is masked now. Sweep at the H3 DiT shape (56 heads, 8640 x 8615, d=128): (4,64) 39 TFLOPS -> (8,80) 73 TFLOPS (54.6 -> 29.3 ms per attention); Klein's 4115-row shape 54 -> 70 TFLOPS. Default is now (8,80); 6/12 waves miscompute (not a power of two) and BN=96 exceeds shared memory. Verify: `grep -c NV_FLASH_WAVES tinygrad/llm/kernels/nv.py` >= 1.
