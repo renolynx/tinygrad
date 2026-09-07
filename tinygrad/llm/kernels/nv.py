@@ -14,7 +14,7 @@
 #     shapes still fill the 80 SMs. Accumulators live in REG placeholders like kernels/amd.py.
 # Correctness on the model: diagnostics/llm_dequant_check.py, ONE PROCESS PER SETTING (getenv is cached per process).
 from __future__ import annotations
-import functools
+import functools, os
 from tinygrad import Tensor, UOp, Device, Context
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops
@@ -133,7 +133,13 @@ def _nv_flash_kernel(out:UOp, q:UOp, k:UOp, v:UOp, BH:int, N:int, NK:int, D:int,
   # Local patch #34 (2026-09-05, MiniMax H3 length-agnostic capture): kvx is an int32[1] buffer holding kv_lo; keys in
   # [kv_lo, KVHI) are masked out. Read at kernel run time, so one captured graph serves every prompt whose padded text
   # segment is KVHI rows long.
-  BM, BN, WAVES = 64, 64, 4
+  # LOCAL PATCH #43 (2026-09-06): tile shape from the env for tuning (BM = 16 * WAVES; BN a multiple of 16 with
+  # 2*DV*(BN+2) halves of shared memory, so <= 80 at DV=128). Non-default shapes get their own kernel name.
+  # Sweep 2026-09-06 at the H3 DiT shape (56 heads, 8640 x 8615, d 128): (4,64) 39 TFLOPS, (4,80) 44, (8,64) 58,
+  # (8,80) 73, (16,64) 69, (16,80) 73; Klein's 4115-row case 54 -> 70 TFLOPS. 8 waves x 80 keys is the default now.
+  WAVES, BN = int(os.environ.get("NV_FLASH_WAVES", "8")), int(os.environ.get("NV_FLASH_BN", "80"))
+  BM = 16 * WAVES
+  assert BN % 16 == 0 and 2 * (DV or D) * (BN + 2) * 2 <= 48 * 1024, "flash kernel: BN must be a multiple of 16 and the V tile must fit shared memory"
   DV = DV or D
   assert D % 32 == 0 and DV % 8 == 0 and DV <= 128 and dv0 + DV <= D, "flash kernel: head dim multiple of 32, output slice <= 128"
   if isinstance(q_start, UOp): q_start = _kernel_var(q_start.unbind_all()[0])
@@ -166,11 +172,14 @@ def _nv_flash_kernel(out:UOp, q:UOp, k:UOp, v:UOp, BH:int, N:int, NK:int, D:int,
   # 1. this tile of V, transposed into shared memory: every thread moves BN*D/8/128 uint4 (8 halves of one key row)
   vt_t = vt.after(tile)
   vstores = []
-  for r in range(BN * DV // 8 // (WAVES * 32)):
+  total_v = BN * DV // 8                                   # uint4 loads for this V tile
+  for r in range((total_v + WAVES * 32 - 1) // (WAVES * 32)):
     idx = tid + r * (WAVES * 32)
-    key, dch = idx // (DV // 8), idx % (DV // 8)
+    full = (r + 1) * (WAVES * 32) <= total_v                 # patch #43: a partial last round (BN*DV/8 not a multiple of
+    idx_c = idx if full else idx.minimum(total_v - 1)        # the thread count, e.g. BN=80 at D=64) is masked, not dropped
+    key, dch = idx_c // (DV // 8), idx_c % (DV // 8)
     vals = vload(bkv, (tile * BN + key).minimum(NK - 1), dv0 + dch * 8)
-    vstores += [vt_t[buf, dch * 8 + j, key].store(vals[j]) for j in range(8)]
+    vstores += [vt_t[buf, dch * 8 + j, key if full else key.valid(idx < total_v)].store(vals[j]) for j in range(8)]
   vt_ready = vt.after(UOp.barrier(UOp.group(*vstores)))
   # 2. S = Q K^T: 8 key n-tiles of 8, D/16 k-steps each. The mma chains start from stacks of REG loads and end in whole-
   # vector REG stores exactly like the GEMM kernel: other forms (stacks of consts / ALU values) render as pointer math.
@@ -242,7 +251,7 @@ def _nv_flash_kernel(out:UOp, q:UOp, k:UOp, v:UOp, BH:int, N:int, NK:int, D:int,
       # the buffer's own dtype, so no relayout/cast pass over a full-width fp32 output follows the kernel
       slot = (lambda c: out[row, bh * D + c]) if out_nbh else (lambda c: out[bh, row, c])   # out_nbh: out is [N, BH*D]
       stores += [slot(c0).store((o[2 * r].load() * inv[r]).cast(odt)), slot(c0 + 1).store((o[2 * r + 1].load() * inv[r]).cast(odt))]
-  name = f"nv_flash_bh{BH}_n{N}_nk{NK}_d{D}_v{dv0}_{DV}_g{GQA}{'_causal' if causal else ''}{'_cache' if cache_mode else ''}{f'_x{KVHI}' if kvx is not None else ''}{'_nbh' if out_nbh else ''}{'' if odt == dtypes.float32 else '_o' + odt.name}"
+  name = f"nv_flash_bh{BH}_n{N}_nk{NK}_d{D}_v{dv0}_{DV}_g{GQA}{'_causal' if causal else ''}{'_cache' if cache_mode else ''}{f'_x{KVHI}' if kvx is not None else ''}{'_nbh' if out_nbh else ''}{'' if odt == dtypes.float32 else '_o' + odt.name}{'' if (WAVES, BN) == (4, 64) else f'_w{WAVES}b{BN}'}"
   return UOp.group(*stores).end(wave, lane).end(qb, bh).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
 def nv_flash_attention(q:Tensor, k:Tensor, v:Tensor, causal:bool=False, q_start:int=0, scale:float|None=None,
