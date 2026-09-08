@@ -123,6 +123,23 @@ def _run_once_full(sched:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int]
   tms = _time_program(proc[0], var_vals, rawbufs, cnt=1, allow_test_size=False, max_global_size=None)
   return all(t != math.inf for t in tms)
 
+def verify_verdict(ref, got) -> tuple[bool, int, float]:
+  """LOCAL PATCH #46 (2026-09-08). (ok, mismatching outputs, relative L2 error) of a candidate's output against the baseline's.
+  Elementwise allclose(rtol=1e-2, atol=1e-3) alone rejects legitimate tensor-core winners of reductions in half/bfloat16:
+  with signed inputs (patch #36) a 3x3 conv over K=4608 cancels, so 2-3% of the outputs miss the elementwise tolerance
+  through summation order alone, while a real miscompile is O(1) wrong everywhere. Rejecting those searched the Flux2
+  and Wan VAE decoders down to the RAW kernel (0.1 TFLOPS, a 92 s decode). So: pass on allclose, or when the relative
+  L2 error is <= 1e-2 AND at most 5% of the outputs miss the elementwise tolerance."""
+  import numpy as np
+  close = np.isclose(ref, got, rtol=1e-2, atol=1e-3, equal_nan=True)
+  bad = int((~close).sum())
+  if bad == 0: return True, 0, 0.0
+  r = ref.astype(np.float64).ravel(); g = got.astype(np.float64).ravel()
+  fin = np.isfinite(r) & np.isfinite(g)
+  if not bool(fin.all()) and bool((np.isfinite(r) != np.isfinite(g)).any()): return False, bad, math.inf
+  den = float(np.linalg.norm(r[fin])); rel = float(np.linalg.norm(g[fin] - r[fin]) / den) if den > 0 else float(np.linalg.norm(g[fin]))
+  return (rel <= 1e-2 and bad <= 0.05 * ref.size), bad, rel
+
 def _verify_winner(base:Scheduler, cand:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int]) -> bool:
   import numpy as np
   try:
@@ -140,12 +157,10 @@ def _verify_winner(base:Scheduler, cand:Scheduler, rawbufs:list[Buffer], var_val
     if got is None:
       if DEBUG >= 1: print(f"BEAM_VERIFY SKIPPED: unreadable cand dtype {rawbufs[0].dtype}; accepting")
       return True
-    ok = bool(np.allclose(ref, got, rtol=1e-2, atol=1e-3, equal_nan=True))
+    ok, bad, rel = verify_verdict(ref, got)
     if DEBUG >= 1:
-      if ok: print(f"BEAM_VERIFY PASS ({ref.size} outputs match) for {cand.applied_opts}")
-      else:
-        bad = int((~np.isclose(ref, got, rtol=1e-2, atol=1e-3, equal_nan=True)).sum())
-        print(f"BEAM_VERIFY REJECTED {cand.applied_opts} ({bad}/{ref.size} outputs mismatch)")
+      if ok: print(f"BEAM_VERIFY PASS ({bad}/{ref.size} outputs outside the elementwise tolerance, rel L2 {rel:.2e}) for {cand.applied_opts}")
+      else: print(f"BEAM_VERIFY REJECTED {cand.applied_opts} ({bad}/{ref.size} outputs mismatch, rel L2 {rel:.2e})")
     return ok
   except Exception as e:
     if DEBUG >= 1: print(f"BEAM_VERIFY inconclusive ({type(e).__name__}: {e}); accepting candidate")

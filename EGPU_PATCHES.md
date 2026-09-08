@@ -271,3 +271,15 @@ collects the whole heap looks identical to one that is slow for any other reason
 size and the used total, and each gc.collect its duration, to stderr. Written while chasing a 92 s Flux2 VAE decode at
 1024 px; the answer there was NOT this path (0 recoveries) but a BEAM winner with zero opts (fixed in ComfyUI's
 `tiny_ops_shim._selective_apply_opts`, 2026-09-08). Verify: `grep -c "alloc recovery" tinygrad/device.py` -> 2.
+
+## Patch 46 (2026-09-08): `verify_verdict` - BEAM_VERIFY tolerates summation-order noise (`codegen/opt/search.py`)
+
+Patch #36 (signed inputs) made `_verify_winner` reject every tensor-core winner of the Flux2 and Wan VAE decoders'
+3x3 convs: with signed inputs a K=4608 reduction cancels, and 2-3% of the outputs miss `allclose(rtol=1e-2, atol=1e-3)`
+purely through bf16/half summation order (the images had passed the pixel gates for days). The re-search then rejected
+every TC candidate too and banked the RAW kernel (0 opts, 0.1 TFLOPS): a 1024 px Flux2 decode took 92 s, Wan 42 s.
+`verify_verdict(ref, got)` returns (ok, mismatches, relative L2 error): pass on allclose, or when rel L2 <= 1e-2 AND at
+most 5% of the outputs miss the elementwise tolerance. Synthetic check: 0.3% multiplicative noise -> PASS (rel 3e-3),
+random garbage -> REJECT (rel 1.4). ComfyUI's `tiny_ops_shim._verify_transfer` uses the same function. The 39 zero-opt
+rows were deleted from cache.db (backup `cache_before_verifyfix_20260908_0119.db`) so those kernels search again.
+Verify: `grep -c "def verify_verdict" tinygrad/codegen/opt/search.py` -> 1.
