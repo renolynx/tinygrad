@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from collections import defaultdict
 from typing import Any, Callable, Generic, TypeVar, Iterator, Generator, Self, TYPE_CHECKING
-import importlib, inspect, functools, pathlib, os, contextlib, re, atexit, pickle, decimal, subprocess, struct, gc, weakref
+import sys, time, importlib, inspect, functools, pathlib, os, contextlib, re, atexit, pickle, decimal, subprocess, struct, gc, weakref
 from tinygrad.helpers import LRU, getenv, diskcache_get, diskcache_put, DEBUG, GlobalCounters, PROFILE, temp, colored
 from tinygrad.helpers import Context, CCACHE, ALLOW_DEVICE_USAGE, MAX_BUFFER_SIZE, cpu_events, ProfileEvent, ProfilePointEvent, suppress_finalizing
 from tinygrad.helpers import select_by_name, select_first_inited, DEV, TracingKey, size_to_str, pluralize, Target, unwrap, round_up
@@ -280,6 +280,9 @@ class LRUAllocator(Allocator, Generic[DeviceType]):
       return c.pop()
     try: return super().alloc(size, options)
     except (RuntimeError, MemoryError):
+      # LOCAL PATCH #45 (2026-09-08): TINY_ALLOC_LOG=1 says how often this recovery path fires and what it costs
+      # (a 1024 px Flux2 VAE decode that should take ~1 s took 92 s with nothing else in the log).
+      if getenv("TINY_ALLOC_LOG"): print(f"alloc recovery: {size/1e6:.1f} MB failed, used {GlobalCounters.mem_used/1e9:.2f} GB", file=sys.stderr, flush=True)
       # Collect before dropping the reuse cache. CPython's cyclic collector is driven by object
       # *counts*, not by bytes, and a torch tensor on the tiny backend is a handful of tiny python
       # objects in a reference cycle pinning a multi-MB device buffer, so the collector has no idea
@@ -292,7 +295,8 @@ class LRUAllocator(Allocator, Generic[DeviceType]):
       self.free_cache()
       try: return super().alloc(size, options)
       except (RuntimeError, MemoryError):
-        gc.collect()
+        _t0 = time.perf_counter(); gc.collect()
+        if getenv("TINY_ALLOC_LOG"): print(f"alloc recovery: gc.collect {time.perf_counter()-_t0:.2f} s", file=sys.stderr, flush=True)
         self.free_cache()
         try: return super().alloc(size, options)
         except (RuntimeError, MemoryError):

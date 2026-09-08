@@ -263,3 +263,11 @@ Verify: `grep -c nv_tc_gemm tinygrad/llm/kernels/nv.py` >= 3.
 ## Patch 43 (2026-09-06): flash kernel tile shape 8 waves x 80 keys (`NV_FLASH_WAVES`, `NV_FLASH_BN`)
 
 `_nv_flash_kernel` takes its tile shape from the env (BM = 16 * WAVES, BN a multiple of 16 with the transposed V tile `2*DV*(BN+2)` halves under 48 KB of shared memory) and names the kernel by it. The V staging loop used to drop a partial last round (`BN*DV/8` not a multiple of the thread count: wrong results at BN=80, D=64); it is masked now. Sweep at the H3 DiT shape (56 heads, 8640 x 8615, d=128): (4,64) 39 TFLOPS -> (8,80) 73 TFLOPS (54.6 -> 29.3 ms per attention); Klein's 4115-row shape 54 -> 70 TFLOPS. Default is now (8,80); 6/12 waves miscompute (not a power of two) and BN=96 exceeds shared memory. Verify: `grep -c NV_FLASH_WAVES tinygrad/llm/kernels/nv.py` >= 1.
+
+## Patch 45 (2026-09-08): `TINY_ALLOC_LOG=1` - log the LRUAllocator's allocation-recovery path (`tinygrad/device.py`)
+
+The recovery path (free_cache -> gc.collect -> retry) is silent, so a phase that is slow because every allocation fails and
+collects the whole heap looks identical to one that is slow for any other reason. With the flag each failure prints the
+size and the used total, and each gc.collect its duration, to stderr. Written while chasing a 92 s Flux2 VAE decode at
+1024 px; the answer there was NOT this path (0 recoveries) but a BEAM winner with zero opts (fixed in ComfyUI's
+`tiny_ops_shim._selective_apply_opts`, 2026-09-08). Verify: `grep -c "alloc recovery" tinygrad/device.py` -> 2.
